@@ -217,6 +217,29 @@ public sealed class AgentWorkflowReplayTests
     }
 
     [Fact]
+    public async Task PreviewRename_OmitsFilesWithoutReturnedEditsWhenTruncated()
+    {
+        using var testSolution = TestSolutionFactory.CreateAgentWorkflowSolution();
+        var target = await TestSolutionFactory.ResolveStringRunMethodAsync(
+            testSolution,
+            TestContext.Current.CancellationToken);
+
+        var result = await RenamePreviewService.PreviewAsync(
+            testSolution.Solution,
+            target,
+            "Process",
+            new RenamePreviewOptions(false, false, false, false),
+            maxEdits: 1,
+            includeDiagnostics: false,
+            TestContext.Current.CancellationToken);
+
+        Assert.True(result.Truncated);
+        Assert.Equal(1, result.ReturnedEdits);
+        Assert.True(result.ChangedFiles > result.Files.Count);
+        Assert.All(result.Files, file => Assert.NotEmpty(file.Edits));
+    }
+
+    [Fact]
     public async Task PreviewRename_DoesNotTreatShiftedPreExistingErrorAsNew()
     {
         using var testSolution = TestSolutionFactory.CreateAgentWorkflowSolution(

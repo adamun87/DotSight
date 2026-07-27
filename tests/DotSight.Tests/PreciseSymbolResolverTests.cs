@@ -143,4 +143,114 @@ public sealed class PreciseSymbolResolverTests
                 SymbolFormatter.GetFullyQualifiedName(result.Match!.Symbol));
         }
     }
+
+    [Fact]
+    public async Task ResolveAsync_CollapsesEquivalentMetadataSymbolsAcrossProjects()
+    {
+        using var testSolution = TestSolutionFactory.CreateAgentWorkflowSolution();
+
+        var result = await SymbolResolver.ResolveAsync(
+            testSolution.Solution,
+            new SymbolSelector("System.Collections.Generic.List<T>"),
+            TestContext.Current.CancellationToken);
+
+        Assert.True(result.Succeeded, result.Error);
+        Assert.Equal("metadata", SymbolResolver.Describe(
+            testSolution.Solution,
+            result.Match!.Symbol,
+            result.Match.Project).Origin);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_SuggestsTypeParametersForGenericMetadataType()
+    {
+        using var testSolution = TestSolutionFactory.CreateAgentWorkflowSolution();
+
+        var result = await SymbolResolver.ResolveAsync(
+            testSolution.Solution,
+            new SymbolSelector("System.Collections.Generic.List"),
+            TestContext.Current.CancellationToken);
+
+        Assert.False(result.Succeeded);
+        Assert.Contains("System.Collections.Generic.List<T>", result.Hint, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_UsesFormattedNameForIndexer()
+    {
+        using var testSolution = TestSolutionFactory.CreateAgentWorkflowSolution();
+        var project = testSolution.Solution.GetProject(testSolution.AppProjectId)!;
+        var compilation = await project.GetCompilationAsync(
+            TestContext.Current.CancellationToken);
+        var indexer = compilation!
+            .GetTypeByMetadataName("Demo.Worker")!
+            .GetMembers()
+            .OfType<IPropertySymbol>()
+            .Single(property => property.IsIndexer);
+        var formattedName = SymbolFormatter.GetFullyQualifiedName(indexer);
+
+        var result = await SymbolResolver.ResolveAsync(
+            testSolution.Solution,
+            new SymbolSelector(formattedName, Project: "Demo"),
+            TestContext.Current.CancellationToken);
+
+        Assert.True(result.Succeeded, result.Error);
+        Assert.True(Assert.IsAssignableFrom<IPropertySymbol>(result.Match!.Symbol).IsIndexer);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_UsesFormattedNamesForExplicitAccessors()
+    {
+        using var testSolution = TestSolutionFactory.CreateAgentWorkflowSolution();
+        var documentId = DocumentId.CreateNewId(testSolution.AppProjectId);
+        var solution = testSolution.Solution.AddDocument(
+            documentId,
+            "Accessors.cs",
+            SourceText.From(
+                """
+                namespace Demo;
+
+                public interface IAccessors
+                {
+                    int Value { get; }
+                    event System.Action Changed;
+                }
+
+                public sealed class Accessors : IAccessors
+                {
+                    int IAccessors.Value => 0;
+                    event System.Action IAccessors.Changed
+                    {
+                        add { }
+                        remove { }
+                    }
+                }
+                """),
+            filePath: Path.Combine(testSolution.RootDirectory, "src", "Demo", "Accessors.cs"));
+        var project = solution.GetProject(testSolution.AppProjectId)!;
+        var compilation = await project.GetCompilationAsync(
+            TestContext.Current.CancellationToken);
+        var type = compilation!.GetTypeByMetadataName("Demo.Accessors")!;
+        var property = type.GetMembers().OfType<IPropertySymbol>().Single();
+        var @event = type.GetMembers().OfType<IEventSymbol>().Single();
+        var accessors = new IMethodSymbol[]
+        {
+            property.GetMethod!,
+            @event.AddMethod!,
+            @event.RemoveMethod!,
+        };
+
+        foreach (var accessor in accessors)
+        {
+            var formattedName = SymbolFormatter.GetFullyQualifiedName(accessor);
+            var result = await SymbolResolver.ResolveAsync(
+                solution,
+                new SymbolSelector(formattedName, Project: "Demo"),
+                TestContext.Current.CancellationToken);
+
+            Assert.True(result.Succeeded, $"Could not resolve '{formattedName}': {result.Error}");
+            Assert.Equal(accessor.MethodKind, Assert.IsAssignableFrom<IMethodSymbol>(
+                result.Match!.Symbol).MethodKind);
+        }
+    }
 }

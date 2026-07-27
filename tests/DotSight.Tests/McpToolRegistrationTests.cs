@@ -187,4 +187,18 @@ public class McpToolRegistrationTests
         Assert.Equal(11, ToolTypes.Length);
         Assert.Equal(11, ExpectedToolNames.Length);
     }
+
+    [Fact]
+    public void PreviewRename_DefaultsCompilerDiagnosticsToOptIn()
+    {
+        var method = typeof(DotSight.Tools.PreviewRenameTool)
+            .GetMethod(nameof(DotSight.Tools.PreviewRenameTool.PreviewRename))!;
+        var parameter = method.GetParameters()
+            .Single(candidate => candidate.Name == "includeDiagnostics");
+        var description = parameter
+            .GetCustomAttribute<System.ComponentModel.DescriptionAttribute>();
+
+        Assert.Equal(false, parameter.DefaultValue);
+        Assert.Contains("Default: false", description!.Description, StringComparison.Ordinal);
+    }
 }

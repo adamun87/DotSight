@@ -68,6 +68,7 @@ internal static class TestSolutionFactory
             public sealed class Worker : IWorker
             {
                 public string Name { get; set; } = "";
+                public string this[int index] => Name;
 
                 public void Run(string value)
                 {

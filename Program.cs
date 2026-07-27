@@ -24,14 +24,14 @@ builder.Services
         options.ServerInfo = new()
         {
             Name = "DotSight",
-            Version = "0.1.0-preview.6"
+            Version = "0.1.0-preview.7"
         };
         options.ServerInstructions = """
             C# solution intelligence for coding agents. Tools analyze saved files and refresh their Roslyn workspace when source or relevant MSBuild inputs change.
 
             Choose the narrowest tool for the task:
             - analyze_symbol — preferred for impact analysis and bounded call flow: references, callers, outgoing calls/constructions, implementations, overrides, snippets, and test-project evidence
-            - preview_rename — compute Roslyn rename edits and post-rename compiler checks without modifying files
+            - preview_rename — compute Roslyn rename edits and optional post-rename compiler checks without modifying files
             - find_symbols — locate a symbol, then use its exact signature or source position when overloads are ambiguous
             - get_symbol_detail / get_source_text / get_document_symbols — inspect targeted declarations and implementations
             - find_references / find_implementations — focused single-section navigation

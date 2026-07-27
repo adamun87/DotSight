@@ -30,6 +30,16 @@ internal static class SemanticEvidence
         if (document is null)
             return null;
 
+        return await CreateAsync(solution, location, document, ct);
+    }
+
+    public static async Task<SourceEvidence> CreateAsync(
+        Solution solution,
+        Location location,
+        Document document,
+        CancellationToken ct)
+    {
+        var span = location.GetLineSpan();
         var text = await document.GetTextAsync(ct);
         var lineIndex = text.Lines.GetLineFromPosition(
             Math.Min(location.SourceSpan.Start, Math.Max(0, text.Length - 1))).LineNumber;
@@ -38,7 +48,10 @@ internal static class SemanticEvidence
             snippet = snippet[..240] + "...";
 
         var semanticModel = await document.GetSemanticModelAsync(ct);
-        var enclosingSymbol = semanticModel?.GetEnclosingSymbol(location.SourceSpan.Start, ct);
+        var enclosingSymbol = GetNavigableEnclosingSymbol(
+            semanticModel,
+            location.SourceSpan.Start,
+            ct);
         var testEvidence = GetTestProjectEvidence(document.Project);
         var solutionDirectory = GetSolutionDirectory(solution);
 
@@ -53,6 +66,21 @@ internal static class SemanticEvidence
             snippet,
             testEvidence is not null,
             testEvidence);
+    }
+
+    private static ISymbol? GetNavigableEnclosingSymbol(
+        SemanticModel? semanticModel,
+        int position,
+        CancellationToken ct)
+    {
+        var symbol = semanticModel?.GetEnclosingSymbol(position, ct);
+        while (symbol is IMethodSymbol { MethodKind: MethodKind.AnonymousFunction }
+               && symbol.ContainingSymbol is not null)
+        {
+            symbol = symbol.ContainingSymbol;
+        }
+
+        return symbol;
     }
 
     public static Document? FindDocument(

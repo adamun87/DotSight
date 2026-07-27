@@ -17,7 +17,7 @@ public sealed class PreviewRenameTool
     };
 
     [McpServerTool(Name = "preview_rename", ReadOnly = true, Destructive = false, OpenWorld = false),
-     Description("Use Roslyn rename semantics to preview every source edit required to rename one exact C# symbol. Returns file checksums, ranges, old/new text, file rename metadata, and newly introduced compiler errors. Never modifies files. Select by fully qualified name plus optional signature, or by file/line/column when overloads are ambiguous.")]
+     Description("Use Roslyn rename semantics to preview every source edit required to rename one exact C# symbol. Returns file checksums, ranges, old/new text, file rename metadata, and optionally newly introduced compiler errors. Never modifies files. Select by fully qualified name plus optional signature, or by file/line/column when overloads are ambiguous.")]
     public static async Task<string> PreviewRename(
         WorkspaceService workspace,
         McpServer server,
@@ -33,7 +33,7 @@ public sealed class PreviewRenameTool
         [Description("Rename matching identifiers inside comments. Default: false.")] bool renameInComments = false,
         [Description("Preview renaming a matching type file as well. Default: false.")] bool renameFile = false,
         [Description("Maximum individual text edits to return, from 1 to 5000. Default: 1000.")] int maxEdits = 1000,
-        [Description("Compile changed projects and report newly introduced errors. Default: true.")] bool includeDiagnostics = true,
+        [Description("Compile changed projects and report newly introduced errors. Enable for the final safety check before applying edits. Default: false.")] bool includeDiagnostics = false,
         [Description("Solution or project file to load. If omitted, auto-detected.")] string? solution = null,
         CancellationToken ct = default)
     {

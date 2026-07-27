@@ -14,7 +14,7 @@ An MCP (Model Context Protocol) server that provides C# solution intelligence to
 | `find_references` | All usages of a symbol across the solution with location info |
 | `find_implementations` | Concrete implementations of interfaces, abstract classes, virtual members |
 | `analyze_symbol` | Bounded impact and call-flow analysis with references, callers, outgoing calls/constructions, implementations, overrides, snippets, and test-project evidence |
-| `preview_rename` | Roslyn-backed rename preview with exact text edits, base checksums, optional file rename metadata, and post-rename compiler checks; never writes files |
+| `preview_rename` | Roslyn-backed rename preview with exact text edits, base checksums, optional file rename metadata, and opt-in post-rename compiler checks; never writes files |
 | `get_diagnostics` | Compiler errors, warnings, and analyzer diagnostics by scope |
 | `inspect_package` | Explore any NuGet package's public API (including already-installed packages) with focused filters for fast type/member lookup |
 

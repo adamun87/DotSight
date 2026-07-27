@@ -109,14 +109,19 @@ internal static class RenamePreviewService
 
                 var oldText = await oldDocument.GetTextAsync(ct);
                 var changes = (await newDocument.GetTextChangesAsync(oldDocument, ct)).ToList();
+                var file = MakeRelative(solutionDirectory, oldDocument.FilePath);
                 AddOrMergeFile(
                     pendingFiles,
                     GetFileIdentity(oldDocument),
                     new PendingRenameFile
                     {
                         ChangeKind = "changed",
-                        File = MakeRelative(solutionDirectory, oldDocument.FilePath),
-                        NewFile = MakeRelative(solutionDirectory, newDocument.FilePath),
+                        File = file,
+                        NewFile = GetPreviewNewFilePath(
+                            solutionDirectory,
+                            oldDocument,
+                            newDocument,
+                            file),
                         BaseSha256 = await ComputeBaseSha256Async(oldDocument, oldText, ct),
                         OldText = oldText,
                     },
@@ -177,6 +182,9 @@ internal static class RenamePreviewService
                 .Take(Math.Max(0, maxEdits - returnedEdits))
                 .Select(change => FormatEdit(pending.OldText, change))
                 .ToList();
+            if (edits.Count == 0 && pending.Changes.Count > 0)
+                continue;
+
             returnedEdits += edits.Count;
             files.Add(new RenameFilePreview(
                 pending.ChangeKind,
@@ -212,7 +220,7 @@ internal static class RenamePreviewService
             SymbolResolver.Describe(solution, target.Symbol, target.Project),
             newName,
             options,
-            files.Count,
+            pendingFiles.Count,
             totalEdits,
             returnedEdits,
             returnedEdits < totalEdits,
@@ -559,4 +567,32 @@ internal static class RenamePreviewService
 
     private static string? MakeRelative(string solutionDirectory, string? path) =>
         path is null ? null : SemanticEvidence.MakeRelativePath(solutionDirectory, path);
+
+    private static string? GetPreviewNewFilePath(
+        string solutionDirectory,
+        Document oldDocument,
+        Document newDocument,
+        string? oldRelativePath)
+    {
+        string? newPath = null;
+        if (newDocument.FilePath is not null
+            && !FilePathComparer.Equals(oldDocument.FilePath, newDocument.FilePath))
+        {
+            newPath = newDocument.FilePath;
+        }
+        else if (!string.Equals(oldDocument.Name, newDocument.Name, StringComparison.Ordinal))
+        {
+            var directory = oldDocument.FilePath is null
+                ? null
+                : Path.GetDirectoryName(oldDocument.FilePath);
+            newPath = directory is null
+                ? newDocument.Name
+                : Path.Combine(directory, newDocument.Name);
+        }
+
+        var newRelativePath = MakeRelative(solutionDirectory, newPath);
+        return string.Equals(oldRelativePath, newRelativePath, StringComparison.Ordinal)
+            ? null
+            : newRelativePath;
+    }
 }

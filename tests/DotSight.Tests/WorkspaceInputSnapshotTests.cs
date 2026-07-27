@@ -1,11 +1,202 @@
 using DotSight.Services;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Text;
 
 namespace DotSight.Tests;
 
 public sealed class WorkspaceInputSnapshotTests
 {
+    [Fact]
+    public void EntryBaselineMatchesStableSolutionInputsWithoutBinaryReferences()
+    {
+        using var directory = new TemporaryDirectory();
+        var projectPath = directory.Write(
+            "Probe.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var sourcePath = directory.Write("Probe.cs", "public sealed class Probe { }");
+        using var workspace = new AdhocWorkspace();
+        var projectId = ProjectId.CreateNewId("Probe");
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId,
+                VersionStamp.Create(),
+                "Probe",
+                "Probe",
+                LanguageNames.CSharp,
+                filePath: projectPath,
+                metadataReferences:
+                [
+                    MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
+                ]))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Probe.cs",
+                SourceText.From("public sealed class Probe { }"),
+                filePath: sourcePath);
+
+        var baseline = WorkspaceInputSnapshot.Create(projectPath);
+        var discovered = WorkspaceInputSnapshot.Create(solution, projectPath);
+
+        Assert.True(baseline.HasSameReloadInputs(discovered));
+    }
+
+    [Fact]
+    public void EntryBaselineIgnoresMissingPerProjectInputsWhenProjectsAreInSubdirectories()
+    {
+        using var directory = new TemporaryDirectory();
+        var entryPath = directory.Write("Demo.sln", "");
+        var projectPath = directory.Write(
+            "src/Probe/Probe.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var sourcePath = directory.Write(
+            "src/Probe/Probe.cs",
+            "public sealed class Probe { }");
+        using var workspace = new AdhocWorkspace();
+        workspace.AddSolution(SolutionInfo.Create(
+            SolutionId.CreateNewId(),
+            VersionStamp.Create(),
+            filePath: entryPath));
+        var projectId = ProjectId.CreateNewId("Probe");
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId,
+                VersionStamp.Create(),
+                "Probe",
+                "Probe",
+                LanguageNames.CSharp,
+                filePath: projectPath))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Probe.cs",
+                SourceText.From("public sealed class Probe { }"),
+                filePath: sourcePath);
+
+        var baseline = WorkspaceInputSnapshot.Create(entryPath);
+        var discovered = WorkspaceInputSnapshot.Create(solution, entryPath);
+
+        Assert.True(baseline.HasSameReloadInputs(discovered));
+    }
+
+    [Fact]
+    public void EntryBaselineIgnoresExternalAnalyzerConfigurationForInitialRetry()
+    {
+        using var directory = new TemporaryDirectory();
+        var entryPath = directory.Write("solution/Demo.sln", "");
+        var projectPath = directory.Write(
+            "solution/Probe.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var sourcePath = directory.Write(
+            "solution/Probe.cs",
+            "public sealed class Probe { }");
+        var configPath = directory.Write(
+            "sdk/analysis.globalconfig",
+            "is_global = true");
+        using var workspace = new AdhocWorkspace();
+        workspace.AddSolution(SolutionInfo.Create(
+            SolutionId.CreateNewId(),
+            VersionStamp.Create(),
+            filePath: entryPath));
+        var projectId = ProjectId.CreateNewId("Probe");
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId,
+                VersionStamp.Create(),
+                "Probe",
+                "Probe",
+                LanguageNames.CSharp,
+                filePath: projectPath))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Probe.cs",
+                SourceText.From("public sealed class Probe { }"),
+                filePath: sourcePath)
+            .AddAnalyzerConfigDocument(
+                DocumentId.CreateNewId(projectId),
+                "analysis.globalconfig",
+                SourceText.From("is_global = true"),
+                filePath: configPath);
+
+        var baseline = WorkspaceInputSnapshot.Create(entryPath);
+        var discovered = WorkspaceInputSnapshot.Create(solution, entryPath);
+
+        Assert.True(baseline.HasSameReloadInputs(discovered));
+    }
+
+    [Fact]
+    public void EntryBaselineRetriesForLinkedSourceOutsideInitialRoot()
+    {
+        using var directory = new TemporaryDirectory();
+        var entryPath = directory.Write("solution/Demo.sln", "");
+        var projectPath = directory.Write(
+            "solution/Probe.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var linkedPath = directory.Write(
+            "shared/Linked.cs",
+            "public sealed class Linked { }");
+        using var workspace = new AdhocWorkspace();
+        workspace.AddSolution(SolutionInfo.Create(
+            SolutionId.CreateNewId(),
+            VersionStamp.Create(),
+            filePath: entryPath));
+        var projectId = ProjectId.CreateNewId("Probe");
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId,
+                VersionStamp.Create(),
+                "Probe",
+                "Probe",
+                LanguageNames.CSharp,
+                filePath: projectPath))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Linked.cs",
+                SourceText.From("public sealed class Linked { }"),
+                filePath: linkedPath);
+
+        var baseline = WorkspaceInputSnapshot.Create(entryPath);
+        var discovered = WorkspaceInputSnapshot.Create(solution, entryPath);
+
+        Assert.False(baseline.HasSameReloadInputs(discovered));
+    }
+
+    [Fact]
+    public void EntryBaselineDoesNotExpandIntoExternalPackageSource()
+    {
+        using var directory = new TemporaryDirectory();
+        var entryPath = directory.Write("solution/Demo.sln", "");
+        var projectPath = directory.Write(
+            "solution/Probe.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var packageSourcePath = directory.Write(
+            "packages/example/1.0.0/_content/PackageSource.cs",
+            "public sealed class PackageSource { }");
+        using var workspace = new AdhocWorkspace();
+        workspace.AddSolution(SolutionInfo.Create(
+            SolutionId.CreateNewId(),
+            VersionStamp.Create(),
+            filePath: entryPath));
+        var projectId = ProjectId.CreateNewId("Probe");
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId,
+                VersionStamp.Create(),
+                "Probe",
+                "Probe",
+                LanguageNames.CSharp,
+                filePath: projectPath))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "PackageSource.cs",
+                SourceText.From("public sealed class PackageSource { }"),
+                filePath: packageSourcePath);
+
+        var baseline = WorkspaceInputSnapshot.Create(entryPath);
+        var discovered = WorkspaceInputSnapshot.Create(solution, entryPath);
+
+        Assert.True(baseline.HasSameReloadInputs(discovered));
+    }
+
     [Fact]
     public void HasChanged_DetectsModifiedSavedSource()
     {

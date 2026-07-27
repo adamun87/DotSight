@@ -124,10 +124,8 @@ internal static class SymbolImpactAnalyzer
                 var evidence = await SemanticEvidence.CreateAsync(
                     solution,
                     location,
-                    reference.Document.Project,
+                    reference.Document,
                     ct);
-                if (evidence is null)
-                    continue;
 
                 items.Add(new ReferenceImpact(
                     await ClassifyReferenceAsync(reference, target.Symbol, ct),
@@ -161,16 +159,54 @@ internal static class SymbolImpactAnalyzer
         if (IsWriteReference(node, reference.Location.SourceSpan))
             return "write";
 
-        if (node.AncestorsAndSelf().OfType<ObjectCreationExpressionSyntax>().Any()
-            || node.AncestorsAndSelf().OfType<ImplicitObjectCreationExpressionSyntax>().Any())
-        {
+        if (IsConstructedTypeReference(node, reference.Location.SourceSpan))
             return "construction";
-        }
 
-        if (node.AncestorsAndSelf().OfType<InvocationExpressionSyntax>().Any())
+        if (IsInvokedExpressionReference(node, reference.Location.SourceSpan))
             return "invocation";
 
         return target is INamedTypeSymbol ? "type-use" : "reference";
+    }
+
+    private static bool IsConstructedTypeReference(SyntaxNode node, TextSpan referenceSpan)
+    {
+        foreach (var creation in node.AncestorsAndSelf().OfType<ObjectCreationExpressionSyntax>())
+        {
+            TextSpan? constructedNameSpan = creation.Type switch
+            {
+                QualifiedNameSyntax qualifiedName => qualifiedName.Right.Identifier.Span,
+                AliasQualifiedNameSyntax aliasQualifiedName => aliasQualifiedName.Name.Identifier.Span,
+                SimpleNameSyntax simpleName => simpleName.Identifier.Span,
+                PredefinedTypeSyntax predefinedType => predefinedType.Keyword.Span,
+                _ => null,
+            };
+            if (constructedNameSpan?.Contains(referenceSpan) == true)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsInvokedExpressionReference(SyntaxNode node, TextSpan referenceSpan)
+    {
+        foreach (var invocation in node.AncestorsAndSelf().OfType<InvocationExpressionSyntax>())
+        {
+            var expression = invocation.Expression;
+            while (expression is ParenthesizedExpressionSyntax parenthesized)
+                expression = parenthesized.Expression;
+
+            var invokedName = expression switch
+            {
+                MemberAccessExpressionSyntax memberAccess => memberAccess.Name,
+                MemberBindingExpressionSyntax memberBinding => memberBinding.Name,
+                SimpleNameSyntax simpleName => simpleName,
+                _ => null,
+            };
+            if (invokedName?.Identifier.Span.Contains(referenceSpan) == true)
+                return true;
+        }
+
+        return false;
     }
 
     private static bool IsWriteReference(SyntaxNode node, TextSpan referenceSpan)

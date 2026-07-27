@@ -7,7 +7,7 @@ namespace DotSight.Tests;
 public sealed class WorkspaceServiceFreshnessTests
 {
     [Fact]
-    public async Task GetSolutionAsync_ReloadsAfterSavedSourceChanges()
+    public async Task GetSnapshotAsync_ReloadsAfterSavedSourceChanges()
     {
         using var directory = new TemporaryProject();
         var projectPath = directory.Write(
@@ -26,8 +26,8 @@ public sealed class WorkspaceServiceFreshnessTests
             new WorkspaceOptions(projectPath),
             NullLogger<WorkspaceService>.Instance);
 
-        var first = await workspace.GetSolutionAsync(ct: TestContext.Current.CancellationToken);
-        var firstText = await first.Projects.Single().Documents
+        using var first = await workspace.GetSnapshotAsync(ct: TestContext.Current.CancellationToken);
+        var firstText = await first.Solution.Projects.Single().Documents
             .Single(document => document.FilePath == sourcePath)
             .GetTextAsync(TestContext.Current.CancellationToken);
         var firstVersion = GetSnapshotVersion(workspace);
@@ -35,8 +35,8 @@ public sealed class WorkspaceServiceFreshnessTests
         directory.Write(
             "Feature.cs",
             "public sealed class Feature { public string After => \"updated\"; }");
-        var second = await workspace.GetSolutionAsync(ct: TestContext.Current.CancellationToken);
-        var secondText = await second.Projects.Single().Documents
+        using var second = await workspace.GetSnapshotAsync(ct: TestContext.Current.CancellationToken);
+        var secondText = await second.Solution.Projects.Single().Documents
             .Single(document => document.FilePath == sourcePath)
             .GetTextAsync(TestContext.Current.CancellationToken);
 

@@ -79,18 +79,6 @@ public sealed class WorkspaceService : IDisposable
         }
     }
 
-    /// <summary>
-    /// Compatibility helper for callers that only need the current solution value.
-    /// Long-running operations should retain the lease returned by <see cref="GetSnapshotAsync"/>.
-    /// </summary>
-    public async Task<Solution> GetSolutionAsync(
-        string? solution = null,
-        CancellationToken ct = default)
-    {
-        using var snapshot = await GetSnapshotAsync(solution, ct);
-        return snapshot.Solution;
-    }
-
     private WorkspaceSnapshot? TryAcquireReusableSnapshot(
         LoadedWorkspace? current,
         string? requestedPath)
@@ -116,9 +104,9 @@ public sealed class WorkspaceService : IDisposable
         const int maxLoadAttempts = 3;
         var isReloadingCurrentPath = current is not null
             && string.Equals(path, current.ResolvedPath, PathComparison);
-        WorkspaceInputSnapshot? loadBaseline = isReloadingCurrentPath
+        var loadBaseline = isReloadingCurrentPath
             ? WorkspaceInputSnapshot.Create(current!.Solution, path)
-            : null;
+            : WorkspaceInputSnapshot.Create(path);
 
         for (var attempt = 1; attempt <= maxLoadAttempts; attempt++)
         {
@@ -153,11 +141,15 @@ public sealed class WorkspaceService : IDisposable
 
                 var discoveredSnapshot = WorkspaceInputSnapshot.Create(candidateSolution, path);
 
-                // The first load of a new path discovers imported, linked, and generated inputs.
-                // Reload once against that complete baseline so changes during discovery cannot be missed.
-                if (loadBaseline is null
-                    || !loadBaseline.HasSameTrackedInputs(discoveredSnapshot))
+                // Retry only when loading discovers mutable inputs outside the pre-open baseline.
+                // Binary references are checked by the published snapshot but do not force every
+                // stable cold load to open the solution twice.
+                if (!loadBaseline.HasSameReloadInputs(discoveredSnapshot))
                 {
+                    _logger.LogInformation(
+                        "Workspace input scope expanded while opening {Path}; retrying once with the complete baseline. New inputs: {NewInputs}",
+                        path,
+                        string.Join(", ", loadBaseline.GetNewReloadInputs(discoveredSnapshot).Take(10)));
                     loadBaseline = discoveredSnapshot;
                     continue;
                 }
@@ -171,7 +163,7 @@ public sealed class WorkspaceService : IDisposable
                     continue;
                 }
 
-                candidateSolution = await MaterializeSolutionAsync(candidateSolution, ct);
+                candidateSolution = await PinSolutionTextAsync(candidateSolution, ct);
                 if (discoveredSnapshot.HasChanged())
                 {
                     _logger.LogWarning(
@@ -225,39 +217,56 @@ public sealed class WorkspaceService : IDisposable
             $"Workspace inputs kept changing while loading '{path}'. Retry after file writes settle.");
     }
 
-    private static async Task<Solution> MaterializeSolutionAsync(
+    private static async Task<Solution> PinSolutionTextAsync(
         Solution solution,
         CancellationToken ct)
     {
-        foreach (var projectId in solution.ProjectIds)
+        var documentTextsTask = Task.WhenAll(
+            solution.Projects
+                .SelectMany(project => project.Documents)
+                .Select(async document => (
+                    document.Id,
+                    Text: await document.GetTextAsync(ct))));
+        var additionalTextsTask = Task.WhenAll(
+            solution.Projects
+                .SelectMany(project => project.AdditionalDocuments)
+                .Select(async document => (
+                    document.Id,
+                    Text: await document.GetTextAsync(ct))));
+        var analyzerConfigTextsTask = Task.WhenAll(
+            solution.Projects
+                .SelectMany(project => project.AnalyzerConfigDocuments)
+                .Select(async document => (
+                    document.Id,
+                    Text: await document.GetTextAsync(ct))));
+
+        await Task.WhenAll(
+            documentTextsTask,
+            additionalTextsTask,
+            analyzerConfigTextsTask);
+
+        foreach (var (documentId, text) in await documentTextsTask)
         {
-            var project = solution.GetProject(projectId)!;
-            foreach (var documentId in project.DocumentIds)
-            {
-                var text = await solution.GetDocument(documentId)!.GetTextAsync(ct);
-                solution = solution.WithDocumentText(
-                    documentId,
-                    text,
-                    PreservationMode.PreserveValue);
-            }
+            solution = solution.WithDocumentText(
+                documentId,
+                text,
+                PreservationMode.PreserveValue);
+        }
 
-            foreach (var documentId in project.AdditionalDocumentIds)
-            {
-                var text = await solution.GetAdditionalDocument(documentId)!.GetTextAsync(ct);
-                solution = solution.WithAdditionalDocumentText(
-                    documentId,
-                    text,
-                    PreservationMode.PreserveValue);
-            }
+        foreach (var (documentId, text) in await additionalTextsTask)
+        {
+            solution = solution.WithAdditionalDocumentText(
+                documentId,
+                text,
+                PreservationMode.PreserveValue);
+        }
 
-            foreach (var documentId in project.AnalyzerConfigDocuments.Select(document => document.Id))
-            {
-                var text = await solution.GetAnalyzerConfigDocument(documentId)!.GetTextAsync(ct);
-                solution = solution.WithAnalyzerConfigDocumentText(
-                    documentId,
-                    text,
-                    PreservationMode.PreserveValue);
-            }
+        foreach (var (documentId, text) in await analyzerConfigTextsTask)
+        {
+            solution = solution.WithAnalyzerConfigDocumentText(
+                documentId,
+                text,
+                PreservationMode.PreserveValue);
         }
 
         return solution;
@@ -304,36 +313,6 @@ public sealed class WorkspaceService : IDisposable
             trackedInputs = info?.TrackedInputs ?? 0,
             source = info?.Source ?? "saved files",
         };
-    }
-
-    public async Task<Compilation?> GetCompilationAsync(ProjectId projectId, CancellationToken ct = default)
-    {
-        using var snapshot = await GetSnapshotAsync(ct: ct);
-        var project = snapshot.Solution.GetProject(projectId);
-        return project is null ? null : await project.GetCompilationAsync(ct);
-    }
-
-    public async Task<IReadOnlyList<(Project Project, Compilation Compilation)>> GetAllCompilationsAsync(CancellationToken ct = default)
-    {
-        using var snapshot = await GetSnapshotAsync(ct: ct);
-        var results = new List<(Project, Compilation)>();
-        foreach (var project in snapshot.Solution.Projects)
-        {
-            var compilation = await project.GetCompilationAsync(ct);
-            if (compilation is not null)
-                results.Add((project, compilation));
-        }
-        return results;
-    }
-
-    /// <summary>
-    /// Finds a project by name (case-insensitive).
-    /// </summary>
-    public async Task<Project?> FindProjectAsync(string projectName, CancellationToken ct = default)
-    {
-        using var snapshot = await GetSnapshotAsync(ct: ct);
-        return snapshot.Solution.Projects.FirstOrDefault(p =>
-            string.Equals(p.Name, projectName, StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>

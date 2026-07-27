@@ -29,7 +29,8 @@ internal sealed record SymbolCandidate(
 internal sealed record SymbolResolutionResult(
     ResolvedSymbol? Match,
     IReadOnlyList<SymbolCandidate> Candidates,
-    string? Error)
+    string? Error,
+    string? Hint = null)
 {
     public bool Succeeded => Match is not null;
 
@@ -37,14 +38,18 @@ internal sealed record SymbolResolutionResult(
     {
         error = Error,
         candidates = Candidates,
-        hint = Candidates.Count > 1
+        hint = Hint ?? (Candidates.Count > 1
             ? "Provide project and signature, or select the symbol by file, line, and column."
-            : null,
+            : null),
     };
 }
 
 internal static partial class SymbolResolver
 {
+    private static readonly StringComparison FilePathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
+
     public static async Task<SymbolResolutionResult> ResolveAsync(
         Solution solution,
         SymbolSelector selector,
@@ -106,7 +111,15 @@ internal static partial class SymbolResolver
     {
         var documentationId = symbol.GetDocumentationCommentId();
         if (!string.IsNullOrWhiteSpace(documentationId))
+        {
+            if (!symbol.Locations.Any(location => location.IsInSource))
+            {
+                var assemblyIdentity = symbol.ContainingAssembly?.Identity.ToString() ?? "unknown-assembly";
+                return $"metadata:{assemblyIdentity}:{documentationId}";
+            }
+
             return $"{project.Id.Id:N}:{documentationId}";
+        }
 
         var location = symbol.Locations.FirstOrDefault(location => location.IsInSource);
         if (location is not null)
@@ -183,7 +196,7 @@ internal static partial class SymbolResolver
                          && string.Equals(
                              Path.GetFullPath(document.FilePath),
                              requestedPath,
-                             StringComparison.OrdinalIgnoreCase)))
+                             FilePathComparison)))
             {
                 var text = await document.GetTextAsync(ct);
                 var lineIndex = selector.Line!.Value - 1;
@@ -261,12 +274,14 @@ internal static partial class SymbolResolver
 
         var query = NormalizeName(selector.FullyQualifiedName!);
         var matches = new List<ResolvedSymbol>();
+        var compilations = new List<(Project Project, Compilation Compilation)>();
 
         foreach (var project in projects)
         {
             var compilation = await project.GetCompilationAsync(ct);
             if (compilation is null)
                 continue;
+            compilations.Add((project, compilation));
 
             foreach (var symbol in EnumerateSourceSymbols(compilation.Assembly.GlobalNamespace))
             {
@@ -277,12 +292,8 @@ internal static partial class SymbolResolver
 
         if (matches.Count == 0)
         {
-            foreach (var project in projects)
+            foreach (var (project, compilation) in compilations)
             {
-                var compilation = await project.GetCompilationAsync(ct);
-                if (compilation is null)
-                    continue;
-
                 foreach (var symbol in ResolveMetadataCandidates(compilation, query))
                 {
                     if (MatchesSignature(symbol, selector.Signature))
@@ -291,16 +302,26 @@ internal static partial class SymbolResolver
             }
         }
 
+        var genericTypeSuggestion = matches.Count == 0
+            ? compilations
+                .SelectMany(item => ResolveGenericTypeCandidates(item.Compilation, query))
+                .Select(SymbolFormatter.GetFullyQualifiedName)
+                .FirstOrDefault()
+            : null;
         return FinalizeMatches(
             solution,
             matches,
-            $"Symbol '{selector.FullyQualifiedName}' was not found in the selected project scope.");
+            $"Symbol '{selector.FullyQualifiedName}' was not found in the selected project scope.",
+            genericTypeSuggestion is null
+                ? null
+                : $"Generic type names must include type parameters. Try '{genericTypeSuggestion}'.");
     }
 
     private static SymbolResolutionResult FinalizeMatches(
         Solution solution,
         IEnumerable<ResolvedSymbol> matches,
-        string notFoundMessage)
+        string notFoundMessage,
+        string? notFoundHint = null)
     {
         var unique = matches
             .GroupBy(match => GetIdentity(match.Symbol, match.Project), StringComparer.Ordinal)
@@ -311,7 +332,7 @@ internal static partial class SymbolResolver
             return new SymbolResolutionResult(unique[0], [], null);
 
         if (unique.Count == 0)
-            return Failure(notFoundMessage);
+            return Failure(notFoundMessage, notFoundHint);
 
         var candidates = unique
             .Select(match => Describe(solution, match.Symbol, match.Project))
@@ -440,6 +461,39 @@ internal static partial class SymbolResolver
         }
     }
 
+    private static IEnumerable<INamedTypeSymbol> ResolveGenericTypeCandidates(
+        Compilation compilation,
+        string query)
+    {
+        var nameWithoutParameters = RemoveParameterList(query);
+        if (nameWithoutParameters.Contains('<'))
+            yield break;
+
+        var segments = SplitTypeName(nameWithoutParameters);
+        if (segments.Count == 0)
+            yield break;
+
+        IEnumerable<INamespaceOrTypeSymbol> containers = [compilation.GlobalNamespace];
+        foreach (var segment in segments.Take(segments.Count - 1))
+        {
+            var name = segment.Trim().TrimStart('@');
+            containers = containers
+                .SelectMany(container => container.GetMembers(name))
+                .OfType<INamespaceOrTypeSymbol>()
+                .ToList();
+            if (!containers.Any())
+                yield break;
+        }
+
+        var typeName = segments[^1].Trim().TrimStart('@');
+        foreach (var type in containers
+                     .SelectMany(container => container.GetTypeMembers(typeName))
+                     .Where(type => type.Arity > 0))
+        {
+            yield return type;
+        }
+    }
+
     private static List<string> SplitTypeName(string displayName)
     {
         var segments = new List<string>();
@@ -548,6 +602,26 @@ internal static partial class SymbolResolver
 
     private static bool MatchesName(ISymbol symbol, string query)
     {
+        if (symbol.Name.Length > 0
+            && !query.Contains(symbol.Name, StringComparison.Ordinal)
+            && GetSpecialTypeMetadataName(query) is null
+            && symbol is not IPropertySymbol { IsIndexer: true }
+            && symbol is not IMethodSymbol
+            {
+                MethodKind: MethodKind.Constructor
+                    or MethodKind.StaticConstructor
+                    or MethodKind.Destructor
+                    or MethodKind.Conversion
+                    or MethodKind.UserDefinedOperator
+                    or MethodKind.PropertyGet
+                    or MethodKind.PropertySet
+                    or MethodKind.EventAdd
+                    or MethodKind.EventRemove
+            })
+        {
+            return false;
+        }
+
         var fullyQualifiedName = NormalizeName(SymbolFormatter.GetFullyQualifiedName(symbol));
         if (string.Equals(fullyQualifiedName, query, StringComparison.Ordinal))
             return true;
@@ -623,8 +697,8 @@ internal static partial class SymbolResolver
     private static string NormalizeSignature(string value) =>
         SignatureWhitespaceRegex().Replace(value.Trim(), " ");
 
-    private static SymbolResolutionResult Failure(string error) =>
-        new(null, [], error);
+    private static SymbolResolutionResult Failure(string error, string? hint = null) =>
+        new(null, [], error, hint);
 
     [GeneratedRegex(@"\s+")]
     private static partial Regex SignatureWhitespaceRegex();

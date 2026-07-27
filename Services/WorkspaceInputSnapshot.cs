@@ -5,15 +5,26 @@ namespace DotSight.Services;
 
 internal sealed class WorkspaceInputSnapshot
 {
+    private static readonly StringComparer FilePathComparer = OperatingSystem.IsWindows()
+        ? StringComparer.OrdinalIgnoreCase
+        : StringComparer.Ordinal;
+    private static readonly StringComparison FilePathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
     private static readonly HashSet<string> RelevantExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".cs",
         ".csx",
+        ".csproj",
+        ".fsproj",
         ".props",
         ".targets",
         ".proj",
+        ".sln",
+        ".slnx",
         ".tasks",
         ".build",
+        ".vbproj",
         ".xml",
         ".editorconfig",
         ".globalconfig",
@@ -37,6 +48,8 @@ internal sealed class WorkspaceInputSnapshot
         "global.json",
         "NuGet.Config",
         "nuget.config",
+        ".editorconfig",
+        ".globalconfig",
     ];
 
     private readonly string[] _roots;
@@ -49,7 +62,7 @@ internal sealed class WorkspaceInputSnapshot
         _knownInputs = knownInputs
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .Select(NormalizePath)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Distinct(FilePathComparer)
             .ToArray();
         _files = CaptureFiles(_roots, _knownInputs);
     }
@@ -58,8 +71,8 @@ internal sealed class WorkspaceInputSnapshot
 
     public static WorkspaceInputSnapshot Create(Solution solution, string entryPath)
     {
-        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var inputs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        var roots = new HashSet<string>(FilePathComparer);
+        var inputs = new HashSet<string>(FilePathComparer)
         {
             entryPath,
         };
@@ -78,7 +91,7 @@ internal sealed class WorkspaceInputSnapshot
                 }
             }
 
-            AddTextDocumentPaths(project.Documents, inputs);
+            AddTextDocumentPaths(project.Documents, inputs, roots);
             AddTextDocumentPaths(project.AdditionalDocuments, inputs);
             AddTextDocumentPaths(project.AnalyzerConfigDocuments, inputs);
 
@@ -102,6 +115,27 @@ internal sealed class WorkspaceInputSnapshot
         return new WorkspaceInputSnapshot(roots, inputs);
     }
 
+    public static WorkspaceInputSnapshot Create(string entryPath)
+    {
+        var inputs = new HashSet<string>(FilePathComparer)
+        {
+            entryPath,
+        };
+        var entryDirectory = Path.GetDirectoryName(entryPath);
+        if (entryDirectory is null)
+            return new WorkspaceInputSnapshot([], inputs);
+
+        AddAncestorBuildInputs(entryDirectory, inputs);
+        var extension = Path.GetExtension(entryPath);
+        if (extension.Equals(".csproj", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".vbproj", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".fsproj", StringComparison.OrdinalIgnoreCase))
+        {
+            inputs.Add(Path.Combine(entryDirectory, "obj", "project.assets.json"));
+        }
+        return new WorkspaceInputSnapshot([entryDirectory], inputs);
+    }
+
     internal static WorkspaceInputSnapshot CreateForPaths(
         IEnumerable<string> roots,
         IEnumerable<string> knownInputs) =>
@@ -122,19 +156,45 @@ internal sealed class WorkspaceInputSnapshot
         return false;
     }
 
-    public bool HasSameTrackedInputs(WorkspaceInputSnapshot other) =>
-        _files.Count == other._files.Count
-        && _files.Keys.All(other._files.ContainsKey);
+    public bool HasSameReloadInputs(WorkspaceInputSnapshot other)
+    {
+        if (GetNewRoots(other).Count > 0)
+        {
+            return false;
+        }
+
+        var inputs = GetComparableReloadInputs(_files);
+        var otherInputs = GetComparableReloadInputs(other._files);
+        return inputs.SetEquals(otherInputs);
+    }
+
+    internal IReadOnlyList<string> GetNewReloadInputs(WorkspaceInputSnapshot other)
+    {
+        var differences = GetNewRoots(other)
+            .Select(root => $"root:{root}")
+            .ToList();
+        differences.AddRange(
+            GetComparableReloadInputs(other._files)
+                .Except(GetComparableReloadInputs(_files), FilePathComparer)
+                .Select(path => $"input:{path}"));
+        return differences;
+    }
 
     private static void AddTextDocumentPaths<TDocument>(
         IEnumerable<TDocument> documents,
-        HashSet<string> inputs)
+        HashSet<string> inputs,
+        HashSet<string>? roots = null)
         where TDocument : TextDocument
     {
         foreach (var document in documents)
         {
             if (document.FilePath is not null)
+            {
                 inputs.Add(document.FilePath);
+                var directory = Path.GetDirectoryName(document.FilePath);
+                if (directory is not null && !IsInSkippedDirectory(directory))
+                    roots?.Add(directory);
+            }
         }
     }
 
@@ -154,7 +214,7 @@ internal sealed class WorkspaceInputSnapshot
         var normalized = roots
             .Where(Directory.Exists)
             .Select(NormalizePath)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Distinct(FilePathComparer)
             .OrderBy(path => path.Length)
             .ToList();
 
@@ -172,7 +232,7 @@ internal sealed class WorkspaceInputSnapshot
         IEnumerable<string> roots,
         IEnumerable<string> knownInputs)
     {
-        var files = new Dictionary<string, FileStamp>(StringComparer.OrdinalIgnoreCase);
+        var files = new Dictionary<string, FileStamp>(FilePathComparer);
 
         foreach (var input in knownInputs)
             files[input] = FileStamp.Create(input);
@@ -252,14 +312,52 @@ internal sealed class WorkspaceInputSnapshot
             StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsInSkippedDirectory(string path)
+    {
+        for (var directory = new DirectoryInfo(path);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            if (SkippedDirectories.Contains(directory.Name))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsReloadInput(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return !extension.Equals(".dll", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".exe", StringComparison.OrdinalIgnoreCase)
+            && !extension.Equals(".winmd", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsComparableReloadInput(string path) =>
+        IsReloadInput(path)
+        && (_roots.Any(root => IsPathWithin(path, root))
+            || CommonBuildInputs.Contains(Path.GetFileName(path), StringComparer.OrdinalIgnoreCase));
+
+    private List<string> GetNewRoots(WorkspaceInputSnapshot other) =>
+        other._roots
+            .Where(otherRoot => !_roots.Any(root => IsPathWithin(otherRoot, root)))
+            .ToList();
+
+    private HashSet<string> GetComparableReloadInputs(
+        IEnumerable<KeyValuePair<string, FileStamp>> files) =>
+        files
+            .Where(item => item.Value.Exists && IsComparableReloadInput(item.Key))
+            .Select(item => item.Key)
+            .ToHashSet(FilePathComparer);
+
     private static bool IsPathWithin(string candidate, string root)
     {
-        if (string.Equals(candidate, root, StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(candidate, root, FilePathComparison))
             return true;
 
         var rootWithSeparator = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             + Path.DirectorySeparatorChar;
-        return candidate.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase);
+        return candidate.StartsWith(rootWithSeparator, FilePathComparison);
     }
 
     private static string NormalizePath(string path) => Path.GetFullPath(path);
