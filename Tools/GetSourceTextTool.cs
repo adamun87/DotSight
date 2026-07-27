@@ -27,6 +27,7 @@ public sealed class GetSourceTextTool
         [Description("Start line (1-based). Only used with 'file'. Default: 1.")] int startLine = 1,
         [Description("End line (1-based, inclusive). Only used with 'file'. Default: end of file. Max 200 lines per request.")] int? endLine = null,
         [Description("Project name to search in when using fullyQualifiedName. If omitted, searches all projects.")] string? project = null,
+        [Description("Exact or trailing signature used to disambiguate overloaded symbols.")] string? signature = null,
         [Description("Solution or project file to load (e.g. 'MyApp.sln', 'MyApp.csproj'). If omitted, auto-detected.")] string? solution = null,
         CancellationToken ct = default)
     {
@@ -43,7 +44,17 @@ public sealed class GetSourceTextTool
         if (!string.IsNullOrEmpty(file))
             return await GetSourceByFile(sln, solutionDir, file, startLine, endLine, ct);
 
-        return await GetSourceBySymbol(sln, solutionDir, fullyQualifiedName!, project, ct);
+        var resolution = await SymbolResolver.ResolveAsync(
+            sln,
+            new SymbolSelector(fullyQualifiedName, signature, project),
+            ct);
+        if (!resolution.Succeeded)
+            return JsonSerializer.Serialize(resolution.ToErrorPayload(), SerializerOptions);
+
+        return await GetSourceBySymbol(
+            solutionDir,
+            resolution.Match!,
+            ct);
     }
 
     private static async Task<string> GetSourceByFile(
@@ -108,72 +119,47 @@ public sealed class GetSourceTextTool
     }
 
     private static async Task<string> GetSourceBySymbol(
-        Solution sln, string solutionDir, string fullyQualifiedName, string? project, CancellationToken ct)
+        string solutionDir,
+        ResolvedSymbol target,
+        CancellationToken ct)
     {
-        var projects = string.IsNullOrEmpty(project)
-            ? sln.Projects
-            : sln.Projects.Where(p => string.Equals(p.Name, project, StringComparison.OrdinalIgnoreCase));
+        var symbol = target.Symbol;
+        var fullyQualifiedName = SymbolFormatter.GetFullyQualifiedName(symbol);
+        var sourceLocation = symbol.Locations.FirstOrDefault(l => l.IsInSource);
+        if (sourceLocation is null)
+            return $"Symbol '{fullyQualifiedName}' is from metadata and has no source code.";
 
-        foreach (var proj in projects)
+        var syntaxRef = symbol.DeclaringSyntaxReferences.FirstOrDefault();
+        if (syntaxRef is null)
+            return $"Symbol '{fullyQualifiedName}' has no syntax reference available.";
+
+        var syntaxNode = await syntaxRef.GetSyntaxAsync(ct);
+        var sourceText = syntaxNode.SyntaxTree.GetText(ct);
+        var span = syntaxNode.FullSpan;
+
+        var startLinePos = sourceText.Lines.GetLinePosition(span.Start);
+        var endLinePos = sourceText.Lines.GetLinePosition(span.End);
+        var filePath = Path.GetRelativePath(solutionDir, syntaxNode.SyntaxTree.FilePath);
+
+        var sb = new StringBuilder();
+        for (int i = startLinePos.Line; i <= endLinePos.Line; i++)
         {
-            var compilation = await proj.GetCompilationAsync(ct);
-            if (compilation is null) continue;
-
-            // Try as type
-            ISymbol? symbol = WorkspaceService.ResolveType(compilation, fullyQualifiedName);
-
-            // Try as member
-            if (symbol is null)
-            {
-                var lastDot = fullyQualifiedName.LastIndexOf('.');
-                if (lastDot > 0)
-                {
-                    var typePart = fullyQualifiedName[..lastDot];
-                    var memberPart = fullyQualifiedName[(lastDot + 1)..];
-                    symbol = WorkspaceService.ResolveMember(compilation, typePart, memberPart);
-                }
-            }
-
-            if (symbol is null) continue;
-
-            // Get source locations
-            var sourceLocation = symbol.Locations.FirstOrDefault(l => l.IsInSource);
-            if (sourceLocation is null)
-                return $"Symbol '{fullyQualifiedName}' is from metadata and has no source code.";
-
-            var syntaxRef = symbol.DeclaringSyntaxReferences.FirstOrDefault();
-            if (syntaxRef is null)
-                return $"Symbol '{fullyQualifiedName}' has no syntax reference available.";
-
-            var syntaxNode = await syntaxRef.GetSyntaxAsync(ct);
-            var sourceText = syntaxNode.SyntaxTree.GetText(ct);
-            var span = syntaxNode.FullSpan;
-
-            var startLinePos = sourceText.Lines.GetLinePosition(span.Start);
-            var endLinePos = sourceText.Lines.GetLinePosition(span.End);
-            var filePath = Path.GetRelativePath(solutionDir, syntaxNode.SyntaxTree.FilePath);
-
-            // Build numbered source
-            var sb = new StringBuilder();
-            for (int i = startLinePos.Line; i <= endLinePos.Line; i++)
-            {
-                var line = sourceText.Lines[i];
-                sb.AppendLine($"{i + 1,5}: {line}");
-            }
-
-            var result = new
-            {
-                symbol = fullyQualifiedName,
-                kind = SymbolFormatter.GetKind(symbol),
-                file = filePath,
-                startLine = startLinePos.Line + 1,
-                endLine = endLinePos.Line + 1,
-                source = sb.ToString()
-            };
-
-            return JsonSerializer.Serialize(result, SerializerOptions);
+            var sourceLine = sourceText.Lines[i];
+            sb.AppendLine($"{i + 1,5}: {sourceLine}");
         }
 
-        return $"Symbol '{fullyQualifiedName}' not found. Check the fully qualified name and project scope.";
+        var result = new
+        {
+            symbol = fullyQualifiedName,
+            signature = SymbolFormatter.GetSignature(symbol),
+            kind = SymbolFormatter.GetKind(symbol),
+            project = target.Project.Name,
+            file = filePath,
+            startLine = startLinePos.Line + 1,
+            endLine = endLinePos.Line + 1,
+            source = sb.ToString()
+        };
+
+        return JsonSerializer.Serialize(result, SerializerOptions);
     }
 }

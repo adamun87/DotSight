@@ -121,7 +121,9 @@ public sealed class FindSymbolsTool
 
                 if (MatchesPattern(type.Name, pattern, regex) && SymbolFormatter.MatchesKindFilter(type, kind))
                 {
-                    var key = SymbolFormatter.GetFullyQualifiedName(type);
+                    var key = $"{assemblyName ?? projectName}:"
+                        + $"{SymbolFormatter.GetFullyQualifiedName(type)}:"
+                        + SymbolFormatter.GetSignature(type);
                     if (seenSymbols.Add(key))
                         results.Add(FormatSymbolResult(type, projectName, solutionDir, assemblyName));
                 }
@@ -138,7 +140,9 @@ public sealed class FindSymbolsTool
                         if (MatchesPattern(typeMember.Name, pattern, regex) &&
                             SymbolFormatter.MatchesKindFilter(typeMember, kind))
                         {
-                            var memberKey = SymbolFormatter.GetFullyQualifiedName(typeMember.ContainingType) + "." + typeMember.Name;
+                            var memberKey = $"{assemblyName ?? projectName}:"
+                                + $"{SymbolFormatter.GetFullyQualifiedName(typeMember)}:"
+                                + SymbolFormatter.GetSignature(typeMember);
                             if (seenSymbols.Add(memberKey))
                                 results.Add(FormatSymbolResult(typeMember, projectName, solutionDir, assemblyName));
                         }

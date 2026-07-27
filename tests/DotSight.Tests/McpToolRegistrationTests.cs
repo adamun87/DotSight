@@ -20,6 +20,8 @@ public class McpToolRegistrationTests
         typeof(DotSight.Tools.GetSourceTextTool),
         typeof(DotSight.Tools.GetDocumentSymbolsTool),
         typeof(DotSight.Tools.InspectPackageTool),
+        typeof(DotSight.Tools.AnalyzeSymbolTool),
+        typeof(DotSight.Tools.PreviewRenameTool),
     ];
 
     private static readonly string[] ExpectedToolNames =
@@ -33,6 +35,8 @@ public class McpToolRegistrationTests
         "get_source_text",
         "get_document_symbols",
         "inspect_package",
+        "analyze_symbol",
+        "preview_rename",
     ];
 
     [Fact]
@@ -180,7 +184,7 @@ public class McpToolRegistrationTests
     [Fact]
     public void ToolCount_MatchesExpected()
     {
-        Assert.Equal(9, ToolTypes.Length);
-        Assert.Equal(9, ExpectedToolNames.Length);
+        Assert.Equal(11, ToolTypes.Length);
+        Assert.Equal(11, ExpectedToolNames.Length);
     }
 }

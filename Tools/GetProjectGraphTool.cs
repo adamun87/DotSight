@@ -11,7 +11,7 @@ namespace DotSight.Tools;
 public sealed class GetProjectGraphTool
 {
     [McpServerTool(Name = "get_project_graph", ReadOnly = true, Destructive = false, OpenWorld = false),
-     Description("Get a complete overview of the codebase in a single call. Returns the project dependency graph with target frameworks, output types, package references, source file lists, and — with includeOutlines=true — a full code outline showing every type and its members across all files. Use this FIRST when you need to understand what a codebase does, before reading individual files.")]
+     Description("Get a broad project and dependency overview. Returns target frameworks, output types, package references, optional source files, and optional code outlines. Use it when the task needs an architecture map; targeted symbol tools do not require this call first.")]
     public static async Task<string> GetProjectGraph(
         WorkspaceService workspace,
         McpServer server,

@@ -7,6 +7,19 @@ namespace DotSight.Services;
 /// </summary>
 public static class SymbolFormatter
 {
+    private static readonly SymbolDisplayFormat FullyQualifiedSymbolFormat = new(
+        globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
+        typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
+        genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
+        memberOptions: SymbolDisplayMemberOptions.IncludeContainingType |
+                       SymbolDisplayMemberOptions.IncludeParameters |
+                       SymbolDisplayMemberOptions.IncludeExplicitInterface,
+        parameterOptions: SymbolDisplayParameterOptions.IncludeType |
+                          SymbolDisplayParameterOptions.IncludeParamsRefOut |
+                          SymbolDisplayParameterOptions.IncludeExtensionThis,
+        miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes |
+                              SymbolDisplayMiscellaneousOptions.IncludeNullableReferenceTypeModifier);
+
     public static string GetKind(ISymbol symbol) => symbol switch
     {
         INamespaceSymbol => "namespace",
@@ -57,7 +70,7 @@ public static class SymbolFormatter
 
     public static string GetFullyQualifiedName(ISymbol symbol)
     {
-        return symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)
+        return symbol.ToDisplayString(FullyQualifiedSymbolFormat)
             .Replace("global::", "");
     }
 

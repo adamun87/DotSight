@@ -17,7 +17,9 @@ public sealed class WorkspaceService : IDisposable
     private MSBuildWorkspace? _workspace;
     private Solution? _solution;
     private string? _resolvedSolutionPath;
-    private DateTime _loadedAt;
+    private WorkspaceInputSnapshot? _inputSnapshot;
+    private DateTime _loadedAtUtc;
+    private long _snapshotVersion;
     private McpServer? _server;
     private string? _shadowCopyDir;
 
@@ -50,17 +52,17 @@ public sealed class WorkspaceService : IDisposable
             return _solution!;
         }
 
-        if (_solution is not null && !ProjectFilesChanged())
+        if (_solution is not null && !WorkspaceInputsChanged())
             return _solution;
 
         await _gate.WaitAsync(ct);
         try
         {
-            if (_solution is not null && !ProjectFilesChanged())
+            if (_solution is not null && !WorkspaceInputsChanged())
                 return _solution;
 
             if (_solution is not null)
-                _logger.LogInformation("Project files changed on disk, reloading solution");
+                _logger.LogInformation("Saved source or build inputs changed on disk, reloading solution");
 
             var pathToLoad = requestedPath ?? _resolvedSolutionPath ?? await DiscoverSolutionPathAsync(ct);
             await LoadSolutionCoreAsync(pathToLoad, ct);
@@ -88,29 +90,95 @@ public sealed class WorkspaceService : IDisposable
 
     private async Task LoadSolutionCoreAsync(string path, CancellationToken ct)
     {
-        _workspace?.Dispose();
-        _resolvedSolutionPath = path;
-        _logger.LogInformation("Opening: {Path}", _resolvedSolutionPath);
-        _workspace = MSBuildWorkspace.Create();
-        _workspace.RegisterWorkspaceFailedHandler(e =>
-            _logger.LogWarning("Workspace warning: {Message}", e.Diagnostic.Message));
+        const int maxLoadAttempts = 3;
+        var isReloadingCurrentPath = _solution is not null
+            && string.Equals(path, _resolvedSolutionPath, StringComparison.OrdinalIgnoreCase);
+        WorkspaceInputSnapshot? loadBaseline = isReloadingCurrentPath
+            ? WorkspaceInputSnapshot.Create(_solution!, path)
+            : null;
 
-        var ext = Path.GetExtension(path);
-        if (ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase) ||
-            ext.Equals(".vbproj", StringComparison.OrdinalIgnoreCase) ||
-            ext.Equals(".fsproj", StringComparison.OrdinalIgnoreCase))
+        for (var attempt = 1; attempt <= maxLoadAttempts; attempt++)
         {
-            var project = await _workspace.OpenProjectAsync(path, cancellationToken: ct);
-            _solution = project.Solution;
-        }
-        else
-        {
-            _solution = await _workspace.OpenSolutionAsync(path, cancellationToken: ct);
+            _logger.LogInformation(
+                "Opening: {Path} (attempt {Attempt}/{MaxAttempts})",
+                path,
+                attempt,
+                maxLoadAttempts);
+            MSBuildWorkspace? candidateWorkspace = MSBuildWorkspace.Create();
+            string? candidateShadowCopyDir = null;
+
+            try
+            {
+                candidateWorkspace.RegisterWorkspaceFailedHandler(e =>
+                    _logger.LogWarning("Workspace warning: {Message}", e.Diagnostic.Message));
+
+                var ext = Path.GetExtension(path);
+                Solution candidateSolution;
+                if (ext.Equals(".csproj", StringComparison.OrdinalIgnoreCase) ||
+                    ext.Equals(".vbproj", StringComparison.OrdinalIgnoreCase) ||
+                    ext.Equals(".fsproj", StringComparison.OrdinalIgnoreCase))
+                {
+                    var project = await candidateWorkspace.OpenProjectAsync(path, cancellationToken: ct);
+                    candidateSolution = project.Solution;
+                }
+                else
+                {
+                    candidateSolution = await candidateWorkspace.OpenSolutionAsync(
+                        path,
+                        cancellationToken: ct);
+                }
+
+                var candidateSnapshot = WorkspaceInputSnapshot.Create(candidateSolution, path);
+
+                // The first load of a new path discovers imported, linked, and generated inputs.
+                // Reload once against that complete baseline so changes during discovery cannot be missed.
+                if (loadBaseline is null)
+                {
+                    loadBaseline = candidateSnapshot;
+                    continue;
+                }
+
+                if (loadBaseline.HasChanged())
+                {
+                    _logger.LogWarning(
+                        "Workspace inputs changed while loading {Path}; retrying with a fresh snapshot",
+                        path);
+                    loadBaseline = WorkspaceInputSnapshot.Create(candidateSolution, path);
+                    continue;
+                }
+
+                (candidateSolution, candidateShadowCopyDir) =
+                    ShadowCopyAnalyzerReferences(candidateSolution);
+                var previousWorkspace = _workspace;
+                var previousShadowCopyDir = _shadowCopyDir;
+                _workspace = candidateWorkspace;
+                _solution = candidateSolution;
+                _resolvedSolutionPath = path;
+                _inputSnapshot = candidateSnapshot;
+                _shadowCopyDir = candidateShadowCopyDir;
+                _loadedAtUtc = DateTime.UtcNow;
+                _snapshotVersion++;
+                candidateWorkspace = null;
+                candidateShadowCopyDir = null;
+
+                previousWorkspace?.Dispose();
+                CleanupShadowDir(previousShadowCopyDir);
+                _logger.LogInformation(
+                    "Loaded snapshot {Version}: {ProjectCount} projects, {InputCount} tracked inputs",
+                    _snapshotVersion,
+                    _solution.ProjectIds.Count,
+                    _inputSnapshot.FileCount);
+                return;
+            }
+            finally
+            {
+                candidateWorkspace?.Dispose();
+                CleanupShadowDir(candidateShadowCopyDir);
+            }
         }
 
-        _loadedAt = DateTime.UtcNow;
-        _solution = ShadowCopyAnalyzerReferences(_solution);
-        _logger.LogInformation("Loaded: {Count} projects", _solution.ProjectIds.Count);
+        throw new InvalidOperationException(
+            $"Workspace inputs kept changing while loading '{path}'. Retry after file writes settle.");
     }
 
     /// <summary>
@@ -141,32 +209,17 @@ public sealed class WorkspaceService : IDisposable
     }
 
     /// <summary>
-    /// Checks whether any solution/project files have been modified since we last loaded.
+    /// Checks whether any saved source or relevant MSBuild inputs changed since the last load.
     /// </summary>
-    private bool ProjectFilesChanged()
+    private bool WorkspaceInputsChanged() => _inputSnapshot?.HasChanged() ?? true;
+
+    public object GetSnapshotInfo() => new
     {
-        if (_loadedAt == default)
-            return true;
-
-        // Check the solution file itself
-        var solutionPath = _resolvedSolutionPath;
-        if (solutionPath is not null && File.Exists(solutionPath) && File.GetLastWriteTimeUtc(solutionPath) > _loadedAt)
-            return true;
-
-        // Check all project files in the loaded solution
-        if (_solution is not null)
-        {
-            foreach (var project in _solution.Projects)
-            {
-                if (project.FilePath is not null &&
-                    File.Exists(project.FilePath) &&
-                    File.GetLastWriteTimeUtc(project.FilePath) > _loadedAt)
-                    return true;
-            }
-        }
-
-        return false;
-    }
+        version = _snapshotVersion,
+        loadedAtUtc = _loadedAtUtc,
+        trackedInputs = _inputSnapshot?.FileCount ?? 0,
+        source = "saved files",
+    };
 
     public async Task<Compilation?> GetCompilationAsync(ProjectId projectId, CancellationToken ct = default)
     {
@@ -214,7 +267,8 @@ public sealed class WorkspaceService : IDisposable
     {
         var type = ResolveType(compilation, fullyQualifiedTypeName);
         if (type is null) return null;
-        return type.GetMembers(memberName).FirstOrDefault();
+        var members = type.GetMembers(memberName);
+        return members.Length == 1 ? members[0] : null;
     }
 
     public void Dispose()
@@ -231,16 +285,26 @@ public sealed class WorkspaceService : IDisposable
     /// DLLs in read-only locations (NuGet cache, dotnet runtime) are loaded directly
     /// since they're never overwritten by builds.
     /// </summary>
-    private Solution ShadowCopyAnalyzerReferences(Solution solution)
+    private static (Solution Solution, string? ShadowCopyDirectory) ShadowCopyAnalyzerReferences(
+        Solution solution)
     {
-        CleanupShadowDir();
+        if (!solution.Projects.SelectMany(project => project.AnalyzerReferences)
+                .Any(reference => reference is AnalyzerFileReference))
+        {
+            return (solution, null);
+        }
 
         IAnalyzerAssemblyLoader loader;
+        string? shadowCopyDir = null;
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            _shadowCopyDir = Path.Combine(Path.GetTempPath(), "dotsight", "shadow", Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(_shadowCopyDir);
-            loader = new ShadowCopyAnalyzerLoader(_shadowCopyDir);
+            shadowCopyDir = Path.Combine(
+                Path.GetTempPath(),
+                "dotsight",
+                "shadow",
+                Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(shadowCopyDir);
+            loader = new ShadowCopyAnalyzerLoader(shadowCopyDir);
         }
         else
         {
@@ -260,16 +324,21 @@ public sealed class WorkspaceService : IDisposable
             solution = solution.WithProjectAnalyzerReferences(project.Id, newRefs);
         }
 
-        return solution;
+        return (solution, shadowCopyDir);
     }
 
     private void CleanupShadowDir()
     {
-        if (_shadowCopyDir is not null)
-        {
-            try { Directory.Delete(_shadowCopyDir, true); } catch { }
-            _shadowCopyDir = null;
-        }
+        CleanupShadowDir(_shadowCopyDir);
+        _shadowCopyDir = null;
+    }
+
+    private static void CleanupShadowDir(string? path)
+    {
+        if (path is null)
+            return;
+
+        try { Directory.Delete(path, true); } catch { }
     }
 
     /// <summary>

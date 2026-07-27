@@ -27,18 +27,19 @@ builder.Services
             Version = "0.1.0-preview.6"
         };
         options.ServerInstructions = """
-            C# solution intelligence server. IMPORTANT: Always use these tools instead of reading files directly — they provide richer, semantic information than raw source code.
+            C# solution intelligence for coding agents. Tools analyze saved files and refresh their Roslyn workspace when source or relevant MSBuild inputs change.
 
-            FIRST CALL: get_project_graph(includeOutlines=true) — returns the complete codebase architecture in ONE call: all projects, dependencies, packages, every source file, and a full outline of all types with their members. Always call this before reading individual files.
-
-            Then use targeted tools:
-            - find_symbols(pattern, includeMetadata=true) — regex search across source and NuGet metadata
-            - get_symbol_detail — full symbol info: members, base types, interfaces, docs
-            - get_source_text — read implementation code by symbol name or file+line range
-            - get_document_symbols — IDE-style file outline
-            - find_references / find_implementations — navigate the code graph
+            Choose the narrowest tool for the task:
+            - analyze_symbol — preferred for impact analysis and bounded call flow: references, callers, outgoing calls/constructions, implementations, overrides, snippets, and test-project evidence
+            - preview_rename — compute Roslyn rename edits and post-rename compiler checks without modifying files
+            - find_symbols — locate a symbol, then use its exact signature or source position when overloads are ambiguous
+            - get_symbol_detail / get_source_text / get_document_symbols — inspect targeted declarations and implementations
+            - find_references / find_implementations — focused single-section navigation
+            - get_project_graph — project/dependency overview; request outlines only when a broad architecture map is actually needed
             - get_diagnostics — compiler errors, warnings, and analyzer issues
-            - inspect_package — explore any NuGet package's public API (including already-installed packages) with type/member/query filters for precise lookup
+            - inspect_package — inspect a NuGet package API
+
+            Semantic tools are static analysis. Continue to use builds, tests, and runtime evidence for validation.
             """;
     })
     .WithStdioServerTransport()

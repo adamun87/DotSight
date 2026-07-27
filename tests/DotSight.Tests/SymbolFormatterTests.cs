@@ -86,6 +86,16 @@ public class SymbolFormatterTests
         Assert.Contains("T", fqn);
     }
 
+    [Fact]
+    public void GetFullyQualifiedName_MemberIncludesContainingTypeAndParameters()
+    {
+        var method = GetType("SampleApp.Models.Dog").GetMembers("Fetch").Single();
+
+        var fqn = SymbolFormatter.GetFullyQualifiedName(method);
+
+        Assert.Equal("SampleApp.Models.Dog.Fetch(string)", fqn);
+    }
+
     // --- GetSignature ---
 
     [Fact]

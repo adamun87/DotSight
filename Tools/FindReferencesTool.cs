@@ -11,12 +11,16 @@ namespace DotSight.Tools;
 public sealed class FindReferencesTool
 {
     [McpServerTool(Name = "find_references", ReadOnly = true, Destructive = false, OpenWorld = false),
-     Description("Find all references (usages) of a symbol across the solution. Returns each reference location classified as read, write, or declaration.")]
+     Description("Find references to one exact symbol across the solution. Returns declarations and reference locations, with explicit truncation. Select by fully qualified name plus optional signature, or by file/line/column when overloads are ambiguous.")]
     public static async Task<string> FindReferences(
         WorkspaceService workspace,
         McpServer server,
-        [Description("Fully qualified name of the symbol to find references for (e.g., 'MyNamespace.MyClass' or 'MyNamespace.MyClass.MyMethod').")] string fullyQualifiedName,
+        [Description("Fully qualified symbol name. May be omitted when file, line, and column are provided.")] string? fullyQualifiedName = null,
         [Description("Project name where the symbol is defined. If omitted, searches all projects.")] string? project = null,
+        [Description("Exact or trailing signature used to disambiguate overloads.")] string? signature = null,
+        [Description("Source file path relative to the solution, used together with line and column for exact position selection.")] string? file = null,
+        [Description("One-based source line for exact position selection.")] int? line = null,
+        [Description("One-based source column for exact position selection.")] int? column = null,
         [Description("Maximum number of reference locations to return. Default: 100.")] int maxResults = 100,
         [Description("Solution or project file to load (e.g. 'MyApp.sln', 'MyApp.csproj'). If omitted, auto-detected.")] string? solution = null,
         CancellationToken ct = default)
@@ -24,103 +28,105 @@ public sealed class FindReferencesTool
         workspace.SetServer(server);
         var sln = await workspace.GetSolutionAsync(solution, ct);
         var solutionDir = Path.GetDirectoryName(sln.FilePath) ?? "";
-
-        // First, resolve the symbol
-        ISymbol? targetSymbol = null;
-        Project? targetProject = null;
-
-        var projects = string.IsNullOrEmpty(project)
-            ? sln.Projects
-            : sln.Projects.Where(p => string.Equals(p.Name, project, StringComparison.OrdinalIgnoreCase));
-
-        foreach (var proj in projects)
-        {
-            var compilation = await proj.GetCompilationAsync(ct);
-            if (compilation is null) continue;
-
-            // Try as type
-            targetSymbol = WorkspaceService.ResolveType(compilation, fullyQualifiedName);
-            if (targetSymbol is not null)
-            {
-                targetProject = proj;
-                break;
-            }
-
-            // Try as member
-            var lastDot = fullyQualifiedName.LastIndexOf('.');
-            if (lastDot > 0)
-            {
-                var typePart = fullyQualifiedName[..lastDot];
-                var memberPart = fullyQualifiedName[(lastDot + 1)..];
-                targetSymbol = WorkspaceService.ResolveMember(compilation, typePart, memberPart);
-                if (targetSymbol is not null)
-                {
-                    targetProject = proj;
-                    break;
-                }
-            }
-        }
-
-        if (targetSymbol is null)
-            return $"Symbol '{fullyQualifiedName}' not found. Check the fully qualified name and project scope.";
+        maxResults = Math.Clamp(maxResults, 1, 1000);
+        var resolution = await SymbolResolver.ResolveAsync(
+            sln,
+            new SymbolSelector(fullyQualifiedName, signature, project, file, line, column),
+            ct);
+        if (!resolution.Succeeded)
+            return JsonSerializer.Serialize(resolution.ToErrorPayload(), SerializerOptions);
 
         // Find all references
-        var references = await SymbolFinder.FindReferencesAsync(targetSymbol, sln, ct);
+        var target = resolution.Match!;
+        var references = await SymbolFinder.FindReferencesAsync(target.Symbol, sln, ct);
         var locations = new List<object>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var totalLocations = 0;
 
         foreach (var refGroup in references)
         {
+            var definitionProject = await SymbolResolver.FindProjectForSymbolAsync(
+                sln,
+                refGroup.Definition,
+                target.Project,
+                ct);
+
             // Add the definition locations
             foreach (var defLocation in refGroup.Definition.Locations)
             {
-                if (locations.Count >= maxResults) break;
                 if (!defLocation.IsInSource) continue;
-                locations.Add(FormatReferenceLocation(defLocation, "declaration", solutionDir, sln));
+                AddLocation(
+                    defLocation,
+                    "declaration",
+                    definitionProject?.Id,
+                    definitionProject?.Name);
             }
 
             // Add reference locations
             foreach (var refLocation in refGroup.Locations)
             {
-                if (locations.Count >= maxResults) break;
                 var loc = refLocation.Location;
                 if (!loc.IsInSource) continue;
 
                 var classification = ClassifyReference(refLocation);
-                locations.Add(FormatReferenceLocation(loc, classification, solutionDir, sln));
+                AddLocation(
+                    loc,
+                    classification,
+                    refLocation.Document.Project.Id,
+                    refLocation.Document.Project.Name);
             }
         }
-
-        if (locations.Count == 0)
-            return $"No references found for '{fullyQualifiedName}'.";
 
         var result = new
         {
             symbol = new
             {
-                name = targetSymbol.Name,
-                kind = SymbolFormatter.GetKind(targetSymbol),
-                fullyQualifiedName = SymbolFormatter.GetFullyQualifiedName(targetSymbol),
-                project = targetProject?.Name
+                name = target.Symbol.Name,
+                kind = SymbolFormatter.GetKind(target.Symbol),
+                fullyQualifiedName = SymbolFormatter.GetFullyQualifiedName(target.Symbol),
+                signature = SymbolFormatter.GetSignature(target.Symbol),
+                project = target.Project.Name
             },
-            totalReferences = locations.Count,
+            totalLocations,
+            returnedLocations = locations.Count,
+            truncated = totalLocations > locations.Count,
             references = locations
         };
 
-        return JsonSerializer.Serialize(result, new JsonSerializerOptions
+        return JsonSerializer.Serialize(result, SerializerOptions);
+
+        void AddLocation(
+            Location location,
+            string classification,
+            ProjectId? projectId,
+            string? projectName)
         {
-            WriteIndented = true,
-            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        });
+            var identity = $"{projectId?.Id:N}:{location.GetLineSpan().Path}:"
+                + $"{location.SourceSpan.Start}:{location.SourceSpan.Length}:{classification}";
+            if (!seen.Add(identity))
+                return;
+
+            totalLocations++;
+            if (locations.Count < maxResults)
+            {
+                locations.Add(
+                    FormatReferenceLocation(
+                        location,
+                        classification,
+                        projectName,
+                        solutionDir));
+            }
+        }
     }
 
-    private static object FormatReferenceLocation(Location location, string classification, string solutionDir, Solution sln)
+    private static object FormatReferenceLocation(
+        Location location,
+        string classification,
+        string? project,
+        string solutionDir)
     {
         var span = location.GetLineSpan();
         var filePath = Path.GetRelativePath(solutionDir, span.Path);
-
-        // Try to get the containing project
-        var documentId = sln.GetDocumentIdsWithFilePath(span.Path).FirstOrDefault();
-        var projectName = documentId is not null ? sln.GetProject(documentId.ProjectId)?.Name : null;
 
         return new
         {
@@ -130,7 +136,7 @@ public sealed class FindReferencesTool
             endLine = span.EndLinePosition.Line + 1,
             endColumn = span.EndLinePosition.Character + 1,
             classification,
-            project = projectName
+            project
         };
     }
 
@@ -140,4 +146,10 @@ public sealed class FindReferencesTool
             return "implicit";
         return "reference";
     }
+
+    private static readonly JsonSerializerOptions SerializerOptions = new()
+    {
+        WriteIndented = true,
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
 }

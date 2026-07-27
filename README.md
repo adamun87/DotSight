@@ -13,10 +13,16 @@ An MCP (Model Context Protocol) server that provides C# solution intelligence to
 | `get_document_symbols` | File outline — all symbols defined in a source file with kind, signature, and line numbers |
 | `find_references` | All usages of a symbol across the solution with location info |
 | `find_implementations` | Concrete implementations of interfaces, abstract classes, virtual members |
+| `analyze_symbol` | Bounded impact and call-flow analysis with references, callers, outgoing calls/constructions, implementations, overrides, snippets, and test-project evidence |
+| `preview_rename` | Roslyn-backed rename preview with exact text edits, base checksums, optional file rename metadata, and post-rename compiler checks; never writes files |
 | `get_diagnostics` | Compiler errors, warnings, and analyzer diagnostics by scope |
 | `inspect_package` | Explore any NuGet package's public API (including already-installed packages) with focused filters for fast type/member lookup |
 
 All tools are **read-only** — no modifications to source code or projects.
+
+DotSight tracks saved C# files and relevant MSBuild inputs. When they change, the next tool call reloads a coherent Roslyn solution snapshot. Unsaved editor buffers are intentionally outside the MCP server's view.
+
+Semantic tools accept an exact fully qualified name and optional signature. When overloads or multi-project symbols are ambiguous, use the returned candidates or select the symbol by `file`, `line`, and `column`. DotSight does not silently choose the first overload.
 
 ## Installation
 
