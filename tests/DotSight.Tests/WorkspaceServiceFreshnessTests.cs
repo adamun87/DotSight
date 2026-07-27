@@ -45,6 +45,56 @@ public sealed class WorkspaceServiceFreshnessTests
         Assert.True(GetSnapshotVersion(workspace) > firstVersion);
     }
 
+    [Fact]
+    public async Task GetSnapshotAsync_OwnsSourceAndInfoAcrossReload()
+    {
+        using var directory = new TemporaryProject();
+        var projectPath = directory.Write(
+            "Owned.csproj",
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net10.0</TargetFramework>
+              </PropertyGroup>
+            </Project>
+            """);
+        var sourcePath = directory.Write(
+            "Feature.cs",
+            "public sealed class Feature { public int Before => 1; }");
+        using var workspace = new WorkspaceService(
+            new WorkspaceOptions(projectPath),
+            NullLogger<WorkspaceService>.Instance);
+
+        using var first = await workspace.GetSnapshotAsync(
+            ct: TestContext.Current.CancellationToken);
+        directory.Write(
+            "Feature.cs",
+            "public sealed class Feature { public string After => \"updated\"; }");
+        using var second = await workspace.GetSnapshotAsync(
+            ct: TestContext.Current.CancellationToken);
+
+        var firstText = await first.Solution.Projects.Single().Documents
+            .Single(document => document.FilePath == sourcePath)
+            .GetTextAsync(TestContext.Current.CancellationToken);
+        var secondText = await second.Solution.Projects.Single().Documents
+            .Single(document => document.FilePath == sourcePath)
+            .GetTextAsync(TestContext.Current.CancellationToken);
+        var firstCompilation = await first.Solution.Projects.Single()
+            .GetCompilationAsync(TestContext.Current.CancellationToken);
+        var secondCompilation = await second.Solution.Projects.Single()
+            .GetCompilationAsync(TestContext.Current.CancellationToken);
+        var firstFeature = firstCompilation!.GetTypeByMetadataName("Feature")!;
+        var secondFeature = secondCompilation!.GetTypeByMetadataName("Feature")!;
+
+        Assert.Contains("Before", firstText.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("After", firstText.ToString(), StringComparison.Ordinal);
+        Assert.Contains("After", secondText.ToString(), StringComparison.Ordinal);
+        Assert.NotEmpty(firstFeature.GetMembers("Before"));
+        Assert.Empty(firstFeature.GetMembers("After"));
+        Assert.NotEmpty(secondFeature.GetMembers("After"));
+        Assert.True(second.Info.Version > first.Info.Version);
+    }
+
     private static long GetSnapshotVersion(WorkspaceService workspace)
     {
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(workspace.GetSnapshotInfo()));

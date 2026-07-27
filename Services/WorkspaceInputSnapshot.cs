@@ -122,6 +122,10 @@ internal sealed class WorkspaceInputSnapshot
         return false;
     }
 
+    public bool HasSameTrackedInputs(WorkspaceInputSnapshot other) =>
+        _files.Count == other._files.Count
+        && _files.Keys.All(other._files.ContainsKey);
+
     private static void AddTextDocumentPaths<TDocument>(
         IEnumerable<TDocument> documents,
         HashSet<string> inputs)

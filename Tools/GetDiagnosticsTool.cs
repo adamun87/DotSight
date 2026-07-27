@@ -24,7 +24,8 @@ public sealed class GetDiagnosticsTool
         CancellationToken ct = default)
     {
         workspace.SetServer(server);
-        var sln = await workspace.GetSolutionAsync(solution, ct);
+        using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+        var sln = workspaceSnapshot.Solution;
         var solutionDir = Path.GetDirectoryName(sln.FilePath) ?? "";
 
         var minSev = ParseSeverity(minSeverity);

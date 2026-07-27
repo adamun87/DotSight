@@ -11,17 +11,16 @@ namespace DotSight.Services;
 
 public sealed class WorkspaceService : IDisposable
 {
+    private static readonly StringComparison PathComparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
+
     private readonly WorkspaceOptions _options;
     private readonly ILogger<WorkspaceService> _logger;
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private MSBuildWorkspace? _workspace;
-    private Solution? _solution;
-    private string? _resolvedSolutionPath;
-    private WorkspaceInputSnapshot? _inputSnapshot;
-    private DateTime _loadedAtUtc;
+    private LoadedWorkspace? _current;
     private long _snapshotVersion;
     private McpServer? _server;
-    private string? _shadowCopyDir;
 
     public WorkspaceService(WorkspaceOptions options, ILogger<WorkspaceService> logger)
     {
@@ -36,37 +35,43 @@ public sealed class WorkspaceService : IDisposable
     public void SetServer(McpServer server) => _server ??= server;
 
     /// <summary>
-    /// Gets (or loads) the solution. If <paramref name="solution"/> is specified,
+    /// Acquires a request-owned workspace snapshot. If <paramref name="solution"/> is specified,
     /// it overrides any previously loaded solution. Accepts a .sln, .slnx, or .csproj
     /// filename (resolved relative to workspace root) or an absolute path.
     /// </summary>
-    public async Task<Solution> GetSolutionAsync(string? solution = null, CancellationToken ct = default)
+    public async Task<WorkspaceSnapshot> GetSnapshotAsync(
+        string? solution = null,
+        CancellationToken ct = default)
     {
         var requestedPath = await ResolveSolutionArgAsync(solution, ct);
-
-        // If a specific solution was requested and it differs from current, force reload
-        if (requestedPath is not null && _resolvedSolutionPath is not null &&
-            !string.Equals(requestedPath, _resolvedSolutionPath, StringComparison.OrdinalIgnoreCase))
-        {
-            await ReloadSolutionAsync(requestedPath, ct);
-            return _solution!;
-        }
-
-        if (_solution is not null && !WorkspaceInputsChanged())
-            return _solution;
+        var reusable = TryAcquireReusableSnapshot(Volatile.Read(ref _current), requestedPath);
+        if (reusable is not null)
+            return reusable;
 
         await _gate.WaitAsync(ct);
         try
         {
-            if (_solution is not null && !WorkspaceInputsChanged())
-                return _solution;
+            var current = Volatile.Read(ref _current);
+            reusable = TryAcquireReusableSnapshot(current, requestedPath);
+            if (reusable is not null)
+                return reusable;
 
-            if (_solution is not null)
+            var pathToLoad = requestedPath
+                ?? current?.ResolvedPath
+                ?? await DiscoverSolutionPathAsync(ct);
+            if (current is not null
+                && !string.Equals(pathToLoad, current.ResolvedPath, PathComparison))
+            {
+                _logger.LogInformation("Switching solution to: {Path}", pathToLoad);
+            }
+            else if (current is not null)
+            {
                 _logger.LogInformation("Saved source or build inputs changed on disk, reloading solution");
+            }
 
-            var pathToLoad = requestedPath ?? _resolvedSolutionPath ?? await DiscoverSolutionPathAsync(ct);
-            await LoadSolutionCoreAsync(pathToLoad, ct);
-            return _solution!;
+            var loaded = await LoadSolutionCoreAsync(pathToLoad, current, ct);
+            return loaded.TryAcquire()
+                ?? throw new InvalidOperationException("The newly loaded workspace was retired before use.");
         }
         finally
         {
@@ -74,27 +79,45 @@ public sealed class WorkspaceService : IDisposable
         }
     }
 
-    private async Task ReloadSolutionAsync(string solutionPath, CancellationToken ct)
+    /// <summary>
+    /// Compatibility helper for callers that only need the current solution value.
+    /// Long-running operations should retain the lease returned by <see cref="GetSnapshotAsync"/>.
+    /// </summary>
+    public async Task<Solution> GetSolutionAsync(
+        string? solution = null,
+        CancellationToken ct = default)
     {
-        await _gate.WaitAsync(ct);
-        try
-        {
-            _logger.LogInformation("Switching solution to: {Path}", solutionPath);
-            await LoadSolutionCoreAsync(solutionPath, ct);
-        }
-        finally
-        {
-            _gate.Release();
-        }
+        using var snapshot = await GetSnapshotAsync(solution, ct);
+        return snapshot.Solution;
     }
 
-    private async Task LoadSolutionCoreAsync(string path, CancellationToken ct)
+    private WorkspaceSnapshot? TryAcquireReusableSnapshot(
+        LoadedWorkspace? current,
+        string? requestedPath)
+    {
+        if (current is null)
+            return null;
+        if (requestedPath is not null
+            && !string.Equals(requestedPath, current.ResolvedPath, PathComparison))
+        {
+            return null;
+        }
+        if (current.InputSnapshot.HasChanged())
+            return null;
+
+        return current.TryAcquire();
+    }
+
+    private async Task<LoadedWorkspace> LoadSolutionCoreAsync(
+        string path,
+        LoadedWorkspace? current,
+        CancellationToken ct)
     {
         const int maxLoadAttempts = 3;
-        var isReloadingCurrentPath = _solution is not null
-            && string.Equals(path, _resolvedSolutionPath, StringComparison.OrdinalIgnoreCase);
+        var isReloadingCurrentPath = current is not null
+            && string.Equals(path, current.ResolvedPath, PathComparison);
         WorkspaceInputSnapshot? loadBaseline = isReloadingCurrentPath
-            ? WorkspaceInputSnapshot.Create(_solution!, path)
+            ? WorkspaceInputSnapshot.Create(current!.Solution, path)
             : null;
 
         for (var attempt = 1; attempt <= maxLoadAttempts; attempt++)
@@ -128,13 +151,14 @@ public sealed class WorkspaceService : IDisposable
                         cancellationToken: ct);
                 }
 
-                var candidateSnapshot = WorkspaceInputSnapshot.Create(candidateSolution, path);
+                var discoveredSnapshot = WorkspaceInputSnapshot.Create(candidateSolution, path);
 
                 // The first load of a new path discovers imported, linked, and generated inputs.
                 // Reload once against that complete baseline so changes during discovery cannot be missed.
-                if (loadBaseline is null)
+                if (loadBaseline is null
+                    || !loadBaseline.HasSameTrackedInputs(discoveredSnapshot))
                 {
-                    loadBaseline = candidateSnapshot;
+                    loadBaseline = discoveredSnapshot;
                     continue;
                 }
 
@@ -143,32 +167,52 @@ public sealed class WorkspaceService : IDisposable
                     _logger.LogWarning(
                         "Workspace inputs changed while loading {Path}; retrying with a fresh snapshot",
                         path);
+                    loadBaseline = discoveredSnapshot;
+                    continue;
+                }
+
+                candidateSolution = await MaterializeSolutionAsync(candidateSolution, ct);
+                if (discoveredSnapshot.HasChanged())
+                {
+                    _logger.LogWarning(
+                        "Workspace inputs changed while materializing {Path}; retrying with a fresh snapshot",
+                        path);
                     loadBaseline = WorkspaceInputSnapshot.Create(candidateSolution, path);
+                    continue;
+                }
+
+                var candidateSnapshot = WorkspaceInputSnapshot.Create(candidateSolution, path);
+                if (candidateSnapshot.HasChanged())
+                {
+                    loadBaseline = candidateSnapshot;
                     continue;
                 }
 
                 (candidateSolution, candidateShadowCopyDir) =
                     ShadowCopyAnalyzerReferences(candidateSolution);
-                var previousWorkspace = _workspace;
-                var previousShadowCopyDir = _shadowCopyDir;
-                _workspace = candidateWorkspace;
-                _solution = candidateSolution;
-                _resolvedSolutionPath = path;
-                _inputSnapshot = candidateSnapshot;
-                _shadowCopyDir = candidateShadowCopyDir;
-                _loadedAtUtc = DateTime.UtcNow;
-                _snapshotVersion++;
+                var info = new WorkspaceSnapshotInfo(
+                    ++_snapshotVersion,
+                    DateTime.UtcNow,
+                    candidateSnapshot.FileCount,
+                    "saved files");
+                var loaded = new LoadedWorkspace(
+                    candidateWorkspace,
+                    candidateSolution,
+                    path,
+                    candidateSnapshot,
+                    candidateShadowCopyDir,
+                    info);
+                var previous = Interlocked.Exchange(ref _current, loaded);
                 candidateWorkspace = null;
                 candidateShadowCopyDir = null;
 
-                previousWorkspace?.Dispose();
-                CleanupShadowDir(previousShadowCopyDir);
+                previous?.Retire();
                 _logger.LogInformation(
                     "Loaded snapshot {Version}: {ProjectCount} projects, {InputCount} tracked inputs",
-                    _snapshotVersion,
-                    _solution.ProjectIds.Count,
-                    _inputSnapshot.FileCount);
-                return;
+                    info.Version,
+                    candidateSolution.ProjectIds.Count,
+                    info.TrackedInputs);
+                return loaded;
             }
             finally
             {
@@ -179,6 +223,44 @@ public sealed class WorkspaceService : IDisposable
 
         throw new InvalidOperationException(
             $"Workspace inputs kept changing while loading '{path}'. Retry after file writes settle.");
+    }
+
+    private static async Task<Solution> MaterializeSolutionAsync(
+        Solution solution,
+        CancellationToken ct)
+    {
+        foreach (var projectId in solution.ProjectIds)
+        {
+            var project = solution.GetProject(projectId)!;
+            foreach (var documentId in project.DocumentIds)
+            {
+                var text = await solution.GetDocument(documentId)!.GetTextAsync(ct);
+                solution = solution.WithDocumentText(
+                    documentId,
+                    text,
+                    PreservationMode.PreserveValue);
+            }
+
+            foreach (var documentId in project.AdditionalDocumentIds)
+            {
+                var text = await solution.GetAdditionalDocument(documentId)!.GetTextAsync(ct);
+                solution = solution.WithAdditionalDocumentText(
+                    documentId,
+                    text,
+                    PreservationMode.PreserveValue);
+            }
+
+            foreach (var documentId in project.AnalyzerConfigDocuments.Select(document => document.Id))
+            {
+                var text = await solution.GetAnalyzerConfigDocument(documentId)!.GetTextAsync(ct);
+                solution = solution.WithAnalyzerConfigDocumentText(
+                    documentId,
+                    text,
+                    PreservationMode.PreserveValue);
+            }
+        }
+
+        return solution;
     }
 
     /// <summary>
@@ -209,30 +291,33 @@ public sealed class WorkspaceService : IDisposable
     }
 
     /// <summary>
-    /// Checks whether any saved source or relevant MSBuild inputs changed since the last load.
+    /// Returns metadata for the currently published snapshot.
+    /// Request handlers should prefer the immutable info on their acquired snapshot.
     /// </summary>
-    private bool WorkspaceInputsChanged() => _inputSnapshot?.HasChanged() ?? true;
-
-    public object GetSnapshotInfo() => new
+    public object GetSnapshotInfo()
     {
-        version = _snapshotVersion,
-        loadedAtUtc = _loadedAtUtc,
-        trackedInputs = _inputSnapshot?.FileCount ?? 0,
-        source = "saved files",
-    };
+        var info = Volatile.Read(ref _current)?.Info;
+        return new
+        {
+            version = info?.Version ?? 0,
+            loadedAtUtc = info?.LoadedAtUtc ?? default,
+            trackedInputs = info?.TrackedInputs ?? 0,
+            source = info?.Source ?? "saved files",
+        };
+    }
 
     public async Task<Compilation?> GetCompilationAsync(ProjectId projectId, CancellationToken ct = default)
     {
-        var sln = await GetSolutionAsync(ct: ct);
-        var project = sln.GetProject(projectId);
+        using var snapshot = await GetSnapshotAsync(ct: ct);
+        var project = snapshot.Solution.GetProject(projectId);
         return project is null ? null : await project.GetCompilationAsync(ct);
     }
 
     public async Task<IReadOnlyList<(Project Project, Compilation Compilation)>> GetAllCompilationsAsync(CancellationToken ct = default)
     {
-        var sln = await GetSolutionAsync(ct: ct);
+        using var snapshot = await GetSnapshotAsync(ct: ct);
         var results = new List<(Project, Compilation)>();
-        foreach (var project in sln.Projects)
+        foreach (var project in snapshot.Solution.Projects)
         {
             var compilation = await project.GetCompilationAsync(ct);
             if (compilation is not null)
@@ -246,8 +331,8 @@ public sealed class WorkspaceService : IDisposable
     /// </summary>
     public async Task<Project?> FindProjectAsync(string projectName, CancellationToken ct = default)
     {
-        var sln = await GetSolutionAsync(ct: ct);
-        return sln.Projects.FirstOrDefault(p =>
+        using var snapshot = await GetSnapshotAsync(ct: ct);
+        return snapshot.Solution.Projects.FirstOrDefault(p =>
             string.Equals(p.Name, projectName, StringComparison.OrdinalIgnoreCase));
     }
 
@@ -273,8 +358,7 @@ public sealed class WorkspaceService : IDisposable
 
     public void Dispose()
     {
-        _workspace?.Dispose();
-        CleanupShadowDir();
+        Interlocked.Exchange(ref _current, null)?.Retire();
     }
 
     /// <summary>
@@ -327,18 +411,109 @@ public sealed class WorkspaceService : IDisposable
         return (solution, shadowCopyDir);
     }
 
-    private void CleanupShadowDir()
-    {
-        CleanupShadowDir(_shadowCopyDir);
-        _shadowCopyDir = null;
-    }
-
     private static void CleanupShadowDir(string? path)
     {
         if (path is null)
             return;
 
         try { Directory.Delete(path, true); } catch { }
+    }
+
+    private sealed class LoadedWorkspace
+    {
+        private readonly object _lifetimeGate = new();
+        private int _referenceCount = 1;
+        private bool _retired;
+        private bool _disposed;
+
+        public LoadedWorkspace(
+            MSBuildWorkspace workspace,
+            Solution solution,
+            string resolvedPath,
+            WorkspaceInputSnapshot inputSnapshot,
+            string? shadowCopyDirectory,
+            WorkspaceSnapshotInfo info)
+        {
+            Workspace = workspace;
+            Solution = solution;
+            ResolvedPath = resolvedPath;
+            InputSnapshot = inputSnapshot;
+            ShadowCopyDirectory = shadowCopyDirectory;
+            Info = info;
+        }
+
+        public MSBuildWorkspace Workspace { get; }
+
+        public Solution Solution { get; }
+
+        public string ResolvedPath { get; }
+
+        public WorkspaceInputSnapshot InputSnapshot { get; }
+
+        public string? ShadowCopyDirectory { get; }
+
+        public WorkspaceSnapshotInfo Info { get; }
+
+        public WorkspaceSnapshot? TryAcquire()
+        {
+            lock (_lifetimeGate)
+            {
+                if (_retired)
+                    return null;
+                _referenceCount++;
+            }
+
+            return new WorkspaceSnapshot(Solution, Info, Release);
+        }
+
+        public void Retire()
+        {
+            var dispose = false;
+            lock (_lifetimeGate)
+            {
+                if (_retired)
+                    return;
+
+                _retired = true;
+                _referenceCount--;
+                if (_referenceCount == 0)
+                {
+                    _disposed = true;
+                    dispose = true;
+                }
+            }
+
+            if (dispose)
+                DisposeResources();
+        }
+
+        private void Release()
+        {
+            var dispose = false;
+            lock (_lifetimeGate)
+            {
+                if (_referenceCount <= 0)
+                    throw new InvalidOperationException("Workspace snapshot released more than once.");
+
+                _referenceCount--;
+                if (_retired && _referenceCount == 0)
+                {
+                    if (_disposed)
+                        throw new InvalidOperationException("Workspace generation was already disposed.");
+                    _disposed = true;
+                    dispose = true;
+                }
+            }
+
+            if (dispose)
+                DisposeResources();
+        }
+
+        private void DisposeResources()
+        {
+            Workspace.Dispose();
+            CleanupShadowDir(ShadowCopyDirectory);
+        }
     }
 
     /// <summary>

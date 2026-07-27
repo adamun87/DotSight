@@ -38,7 +38,8 @@ public sealed class FindSymbolsTool
                 return $"Invalid regex pattern: {ex.Message}";
             }
         }
-        var sln = await workspace.GetSolutionAsync(solution, ct);
+        using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+        var sln = workspaceSnapshot.Solution;
         var solutionDir = Path.GetDirectoryName(sln.FilePath) ?? "";
         var results = new List<object>();
         var seenSymbols = new HashSet<string>();

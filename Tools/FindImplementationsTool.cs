@@ -26,7 +26,8 @@ public sealed class FindImplementationsTool
         CancellationToken ct = default)
     {
         workspace.SetServer(server);
-        var sln = await workspace.GetSolutionAsync(solution, ct);
+        using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+        var sln = workspaceSnapshot.Solution;
         var solutionDir = Path.GetDirectoryName(sln.FilePath) ?? "";
         maxResults = Math.Clamp(maxResults, 1, 1000);
         var resolution = await SymbolResolver.ResolveAsync(

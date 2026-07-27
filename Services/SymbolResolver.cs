@@ -374,27 +374,177 @@ internal static partial class SymbolResolver
         Compilation compilation,
         string query)
     {
-        var type = compilation.GetTypeByMetadataName(query);
-        if (type is not null)
-            yield return type;
-
         var nameWithoutParameters = RemoveParameterList(query);
-        var lastDot = nameWithoutParameters.LastIndexOf('.');
-        if (lastDot <= 0)
-            yield break;
+        var seen = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
 
-        var containingTypeName = nameWithoutParameters[..lastDot];
-        var memberName = nameWithoutParameters[(lastDot + 1)..];
-        var containingType = compilation.GetTypeByMetadataName(containingTypeName);
-        if (containingType is null)
-            yield break;
-
-        foreach (var member in containingType.GetMembers(memberName))
+        foreach (var type in ResolveMetadataTypes(compilation, nameWithoutParameters))
         {
-            if (MatchesName(member, query))
-                yield return member;
+            if (MatchesName(type, query) && seen.Add(type))
+                yield return type;
+        }
+
+        foreach (var separator in GetTopLevelDotIndexes(nameWithoutParameters).Reverse())
+        {
+            var containingTypeName = nameWithoutParameters[..separator];
+            foreach (var containingType in ResolveMetadataTypes(compilation, containingTypeName))
+            {
+                foreach (var member in containingType.GetMembers())
+                {
+                    if (MatchesName(member, query) && seen.Add(member))
+                        yield return member;
+                }
+            }
         }
     }
+
+    private static IEnumerable<INamedTypeSymbol> ResolveMetadataTypes(
+        Compilation compilation,
+        string displayName)
+    {
+        var seen = new HashSet<INamedTypeSymbol>(SymbolEqualityComparer.Default);
+        var specialTypeName = GetSpecialTypeMetadataName(displayName);
+        if (specialTypeName is not null)
+        {
+            foreach (var type in compilation.GetTypesByMetadataName(specialTypeName))
+            {
+                if (seen.Add(type))
+                    yield return type;
+            }
+        }
+
+        var segments = SplitTypeName(displayName);
+        for (var topLevelTypeIndex = segments.Count - 1;
+             topLevelTypeIndex >= 0;
+             topLevelTypeIndex--)
+        {
+            var metadataName = string.Join(
+                ".",
+                segments
+                    .Take(topLevelTypeIndex + 1)
+                    .Select(ToMetadataNameSegment));
+            if (topLevelTypeIndex + 1 < segments.Count)
+            {
+                metadataName += "+"
+                    + string.Join(
+                        "+",
+                        segments
+                            .Skip(topLevelTypeIndex + 1)
+                            .Select(ToMetadataNameSegment));
+            }
+
+            foreach (var type in compilation.GetTypesByMetadataName(metadataName))
+            {
+                if (seen.Add(type))
+                    yield return type;
+            }
+        }
+    }
+
+    private static List<string> SplitTypeName(string displayName)
+    {
+        var segments = new List<string>();
+        var segmentStart = 0;
+        var genericDepth = 0;
+        for (var index = 0; index < displayName.Length; index++)
+        {
+            switch (displayName[index])
+            {
+                case '<':
+                    genericDepth++;
+                    break;
+                case '>':
+                    genericDepth = Math.Max(0, genericDepth - 1);
+                    break;
+                case '.' when genericDepth == 0:
+                    segments.Add(displayName[segmentStart..index]);
+                    segmentStart = index + 1;
+                    break;
+            }
+        }
+
+        segments.Add(displayName[segmentStart..]);
+        return segments
+            .Select(segment => segment.Trim())
+            .Where(segment => segment.Length > 0)
+            .ToList();
+    }
+
+    private static IEnumerable<int> GetTopLevelDotIndexes(string value)
+    {
+        var genericDepth = 0;
+        for (var index = 0; index < value.Length; index++)
+        {
+            switch (value[index])
+            {
+                case '<':
+                    genericDepth++;
+                    break;
+                case '>':
+                    genericDepth = Math.Max(0, genericDepth - 1);
+                    break;
+                case '.' when genericDepth == 0:
+                    yield return index;
+                    break;
+            }
+        }
+    }
+
+    private static string ToMetadataNameSegment(string segment)
+    {
+        segment = segment.Trim().TrimEnd('?');
+        if (segment.StartsWith('@'))
+            segment = segment[1..];
+
+        var genericStart = segment.IndexOf('<');
+        if (genericStart < 0)
+            return segment;
+
+        var arity = 1;
+        var genericDepth = 0;
+        for (var index = genericStart + 1; index < segment.Length; index++)
+        {
+            switch (segment[index])
+            {
+                case '<':
+                    genericDepth++;
+                    break;
+                case '>':
+                    if (genericDepth == 0)
+                        return $"{segment[..genericStart]}`{arity}";
+                    genericDepth--;
+                    break;
+                case ',' when genericDepth == 0:
+                    arity++;
+                    break;
+            }
+        }
+
+        return segment;
+    }
+
+    private static string? GetSpecialTypeMetadataName(string displayName) =>
+        displayName.Trim().TrimEnd('?') switch
+        {
+            "bool" => "System.Boolean",
+            "byte" => "System.Byte",
+            "sbyte" => "System.SByte",
+            "short" => "System.Int16",
+            "ushort" => "System.UInt16",
+            "int" => "System.Int32",
+            "uint" => "System.UInt32",
+            "long" => "System.Int64",
+            "ulong" => "System.UInt64",
+            "nint" => "System.IntPtr",
+            "nuint" => "System.UIntPtr",
+            "char" => "System.Char",
+            "float" => "System.Single",
+            "double" => "System.Double",
+            "decimal" => "System.Decimal",
+            "string" => "System.String",
+            "object" => "System.Object",
+            "void" => "System.Void",
+            _ => null,
+        };
 
     private static bool MatchesName(ISymbol symbol, string query)
     {

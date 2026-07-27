@@ -32,7 +32,8 @@ public sealed class AnalyzeSymbolTool
         CancellationToken ct = default)
     {
         workspace.SetServer(server);
-        var snapshot = await workspace.GetSolutionAsync(solution, ct);
+        using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+        var snapshot = workspaceSnapshot.Solution;
         var resolution = await SymbolResolver.ResolveAsync(
             snapshot,
             new SymbolSelector(fullyQualifiedName, signature, project, file, line, column),
@@ -42,7 +43,7 @@ public sealed class AnalyzeSymbolTool
             return JsonSerializer.Serialize(
                 new
                 {
-                    workspace = workspace.GetSnapshotInfo(),
+                    workspace = workspaceSnapshot.Info,
                     resolution = resolution.ToErrorPayload(),
                 },
                 SerializerOptions);
@@ -57,7 +58,7 @@ public sealed class AnalyzeSymbolTool
         return JsonSerializer.Serialize(
             new
             {
-                workspace = workspace.GetSnapshotInfo(),
+                workspace = workspaceSnapshot.Info,
                 analysis,
             },
             SerializerOptions);

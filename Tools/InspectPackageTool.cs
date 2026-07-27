@@ -55,7 +55,8 @@ public sealed class InspectPackageTool
         var tfm = "net8.0"; // safe default
         try
         {
-            var sln = await workspace.GetSolutionAsync(solution, ct);
+            using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+            var sln = workspaceSnapshot.Solution;
             var firstProject = sln.Projects.FirstOrDefault();
             if (firstProject is not null)
             {
@@ -501,7 +502,8 @@ public sealed class InspectPackageTool
     {
         try
         {
-            var sln = await workspace.GetSolutionAsync(solution, ct);
+            using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+            var sln = workspaceSnapshot.Solution;
             var projectPaths = sln.Projects
                 .Select(p => p.FilePath)
                 .Where(p => !string.IsNullOrWhiteSpace(p) && File.Exists(p))

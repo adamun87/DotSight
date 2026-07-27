@@ -45,7 +45,8 @@ public sealed class PreviewRenameTool
                 SerializerOptions);
         }
 
-        var snapshot = await workspace.GetSolutionAsync(solution, ct);
+        using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+        var snapshot = workspaceSnapshot.Solution;
         var resolution = await SymbolResolver.ResolveAsync(
             snapshot,
             new SymbolSelector(fullyQualifiedName, signature, project, file, line, column),
@@ -55,7 +56,7 @@ public sealed class PreviewRenameTool
             return JsonSerializer.Serialize(
                 new
                 {
-                    workspace = workspace.GetSnapshotInfo(),
+                    workspace = workspaceSnapshot.Info,
                     resolution = resolution.ToErrorPayload(),
                 },
                 SerializerOptions);
@@ -66,7 +67,7 @@ public sealed class PreviewRenameTool
             return JsonSerializer.Serialize(
                 new
                 {
-                    workspace = workspace.GetSnapshotInfo(),
+                    workspace = workspaceSnapshot.Info,
                     error = "Metadata symbols cannot be renamed because they have no source declaration in this solution.",
                 },
                 SerializerOptions);
@@ -77,7 +78,7 @@ public sealed class PreviewRenameTool
             return JsonSerializer.Serialize(
                 new
                 {
-                    workspace = workspace.GetSnapshotInfo(),
+                    workspace = workspaceSnapshot.Info,
                     error = $"The symbol is already named '{newName}'.",
                 },
                 SerializerOptions);
@@ -98,7 +99,7 @@ public sealed class PreviewRenameTool
         return JsonSerializer.Serialize(
             new
             {
-                workspace = workspace.GetSnapshotInfo(),
+                workspace = workspaceSnapshot.Info,
                 preview,
             },
             SerializerOptions);

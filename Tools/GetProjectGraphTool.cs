@@ -23,7 +23,8 @@ public sealed class GetProjectGraphTool
         CancellationToken ct = default)
     {
         workspace.SetServer(server);
-        var sln = await workspace.GetSolutionAsync(solution, ct);
+        using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+        var sln = workspaceSnapshot.Solution;
         var solutionDir = Path.GetDirectoryName(sln.FilePath ?? sln.Projects.FirstOrDefault()?.FilePath) ?? "";
 
         var projects = string.IsNullOrEmpty(project)

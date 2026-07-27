@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Rename;
 using Microsoft.CodeAnalysis.Text;
@@ -296,31 +297,40 @@ internal static class RenamePreviewService
         string newName,
         CancellationToken ct)
     {
-        var changedProjectIds = renamed.GetChanges(original)
-            .GetProjectChanges()
-            .Select(change => change.ProjectId)
-            .Distinct()
-            .ToList();
+        var projectChanges = renamed.GetChanges(original).GetProjectChanges().ToList();
         var preExistingErrors = 0;
         var newErrors = new List<RenameDiagnostic>();
         var validationComplete = true;
 
-        foreach (var projectId in changedProjectIds)
+        foreach (var projectChange in projectChanges)
         {
-            var originalCompilation = await original.GetProject(projectId)!.GetCompilationAsync(ct);
-            var renamedCompilation = await renamed.GetProject(projectId)!.GetCompilationAsync(ct);
+            var originalProject = original.GetProject(projectChange.ProjectId)!;
+            var renamedProject = renamed.GetProject(projectChange.ProjectId)!;
+            var originalCompilation = await originalProject.GetCompilationAsync(ct);
+            var renamedCompilation = await renamedProject.GetCompilationAsync(ct);
             if (originalCompilation is null || renamedCompilation is null)
             {
                 validationComplete = false;
                 continue;
             }
 
+            var documentChanges = await GetDocumentChangesAsync(
+                projectChange,
+                originalProject,
+                renamedProject,
+                ct);
             var originalErrors = originalCompilation.GetDiagnostics(ct)
                 .Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
                 .ToList();
             var unmatchedOriginalErrors = originalErrors
                 .GroupBy(
-                    diagnostic => GetDiagnosticKey(diagnostic, oldName, newName),
+                    diagnostic => GetDiagnosticKey(
+                        diagnostic,
+                        originalProject,
+                        documentChanges,
+                        mapToRenamedDocument: true,
+                        oldName,
+                        newName),
                     StringComparer.Ordinal)
                 .ToDictionary(
                     group => group.Key,
@@ -331,7 +341,13 @@ internal static class RenamePreviewService
             foreach (var diagnostic in renamedCompilation.GetDiagnostics(ct)
                          .Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error))
             {
-                var key = GetDiagnosticKey(diagnostic, oldName, newName);
+                var key = GetDiagnosticKey(
+                    diagnostic,
+                    renamedProject,
+                    documentChanges,
+                    mapToRenamedDocument: false,
+                    oldName,
+                    newName);
                 if (unmatchedOriginalErrors.TryGetValue(key, out var count) && count > 0)
                 {
                     unmatchedOriginalErrors[key] = count - 1;
@@ -350,21 +366,137 @@ internal static class RenamePreviewService
             newErrors.Take(MaxDiagnostics).ToList());
     }
 
+    private static async Task<IReadOnlyDictionary<DocumentId, IReadOnlyList<TextChange>>>
+        GetDocumentChangesAsync(
+            ProjectChanges projectChanges,
+            Project originalProject,
+            Project renamedProject,
+            CancellationToken ct)
+    {
+        var changes = new Dictionary<DocumentId, IReadOnlyList<TextChange>>();
+        foreach (var documentId in projectChanges.GetChangedDocuments())
+        {
+            var originalDocument = originalProject.GetDocument(documentId);
+            var renamedDocument = renamedProject.GetDocument(documentId);
+            if (originalDocument is null || renamedDocument is null)
+                continue;
+
+            changes[documentId] = (await renamedDocument.GetTextChangesAsync(originalDocument, ct))
+                .OrderBy(change => change.Span.Start)
+                .ToList();
+        }
+
+        return changes;
+    }
+
     private static string GetDiagnosticKey(
         Diagnostic diagnostic,
+        Project project,
+        IReadOnlyDictionary<DocumentId, IReadOnlyList<TextChange>> documentChanges,
+        bool mapToRenamedDocument,
         string oldName,
         string newName)
     {
-        var message = diagnostic.GetMessage(CultureInfo.InvariantCulture);
+        var message = NormalizeDiagnosticMessage(
+            diagnostic.GetMessage(CultureInfo.InvariantCulture),
+            oldName,
+            newName);
+        var location = GetDiagnosticLocationKey(
+            diagnostic,
+            project,
+            documentChanges,
+            mapToRenamedDocument);
+        return $"{diagnostic.Id}:{message}:{location}";
+    }
+
+    private static string NormalizeDiagnosticMessage(
+        string message,
+        string oldName,
+        string newName)
+    {
+        const string identifierPart = @"[\p{L}\p{N}\p{M}\p{Pc}\p{Cf}]";
         foreach (var name in new[] { oldName, newName }
                      .Where(name => !string.IsNullOrEmpty(name))
+                     .SelectMany(name => name.StartsWith('@')
+                         ? new[] { name, name[1..] }
+                         : new[] { name })
                      .Distinct(StringComparer.Ordinal)
                      .OrderByDescending(name => name.Length))
         {
-            message = message.Replace(name, "{renamed-symbol}", StringComparison.Ordinal);
+            var pattern = $@"(?<!{identifierPart}){Regex.Escape(name)}(?!{identifierPart})";
+            message = Regex.Replace(
+                message,
+                pattern,
+                "{renamed-symbol}",
+                RegexOptions.CultureInvariant);
         }
 
-        return $"{diagnostic.Id}:{message}";
+        return message;
+    }
+
+    private static string GetDiagnosticLocationKey(
+        Diagnostic diagnostic,
+        Project project,
+        IReadOnlyDictionary<DocumentId, IReadOnlyList<TextChange>> documentChanges,
+        bool mapToRenamedDocument)
+    {
+        if (!diagnostic.Location.IsInSource)
+            return "non-source";
+
+        var span = diagnostic.Location.SourceSpan;
+        var sourceTree = diagnostic.Location.SourceTree;
+        var document = sourceTree is null ? null : project.GetDocument(sourceTree);
+        if (document is not null)
+        {
+            if (mapToRenamedDocument
+                && documentChanges.TryGetValue(document.Id, out var changes))
+            {
+                span = MapTextSpan(span, changes);
+            }
+
+            return $"document:{document.Id.Id:N}:{span.Start}:{span.Length}";
+        }
+
+        var path = diagnostic.Location.GetLineSpan().Path;
+        return $"path:{path}:{span.Start}:{span.Length}";
+    }
+
+    private static TextSpan MapTextSpan(
+        TextSpan span,
+        IReadOnlyList<TextChange> changes)
+    {
+        var start = MapTextPosition(span.Start, isEnd: false, changes);
+        var end = MapTextPosition(span.End, isEnd: true, changes);
+        return TextSpan.FromBounds(Math.Min(start, end), Math.Max(start, end));
+    }
+
+    private static int MapTextPosition(
+        int position,
+        bool isEnd,
+        IReadOnlyList<TextChange> changes)
+    {
+        var delta = 0;
+        foreach (var change in changes)
+        {
+            if (position < change.Span.Start)
+                break;
+
+            var mappedStart = change.Span.Start + delta;
+            var newLength = change.NewText?.Length ?? 0;
+            if (change.Span.Length == 0 && position == change.Span.Start)
+                return mappedStart + (isEnd ? 0 : newLength);
+
+            if (position <= change.Span.End)
+            {
+                if (position == change.Span.End)
+                    return mappedStart + newLength;
+                return mappedStart + (isEnd ? newLength : 0);
+            }
+
+            delta += newLength - change.Span.Length;
+        }
+
+        return position + delta;
     }
 
     private static RenameDiagnostic FormatDiagnostic(Diagnostic diagnostic, Solution solution)

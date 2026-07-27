@@ -38,7 +38,8 @@ public sealed class GetSourceTextTool
         if (!string.IsNullOrEmpty(fullyQualifiedName) && !string.IsNullOrEmpty(file))
             return "Provide either 'fullyQualifiedName' or 'file', not both.";
 
-        var sln = await workspace.GetSolutionAsync(solution, ct);
+        using var workspaceSnapshot = await workspace.GetSnapshotAsync(solution, ct);
+        var sln = workspaceSnapshot.Solution;
         var solutionDir = Path.GetDirectoryName(sln.FilePath) ?? "";
 
         if (!string.IsNullOrEmpty(file))
