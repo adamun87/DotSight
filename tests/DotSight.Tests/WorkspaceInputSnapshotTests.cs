@@ -123,6 +123,77 @@ public sealed class WorkspaceInputSnapshotTests
         Assert.True(baseline.HasSameReloadInputs(discovered));
     }
 
+    [Theory]
+    [InlineData("settings.json")]
+    [InlineData("ContentDialogStyle.axaml")]
+    [InlineData("Strings.resx")]
+    public void EntryBaselineIgnoresMsBuildOnlyTextInputsForInitialRetry(string fileName)
+    {
+        using var directory = new TemporaryDirectory();
+        var entryPath = directory.Write("solution/Demo.sln", "");
+        var projectPath = directory.Write(
+            "solution/Probe.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var sourcePath = directory.Write(
+            "solution/Probe.cs",
+            "public sealed class Probe { }");
+        var additionalPath = directory.Write($"solution/{fileName}", "{}");
+        using var workspace = new AdhocWorkspace();
+        workspace.AddSolution(SolutionInfo.Create(
+            SolutionId.CreateNewId(),
+            VersionStamp.Create(),
+            filePath: entryPath));
+        var projectId = ProjectId.CreateNewId("Probe");
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId,
+                VersionStamp.Create(),
+                "Probe",
+                "Probe",
+                LanguageNames.CSharp,
+                filePath: projectPath))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Probe.cs",
+                SourceText.From("public sealed class Probe { }"),
+                filePath: sourcePath)
+            .AddAdditionalDocument(
+                DocumentId.CreateNewId(projectId),
+                fileName,
+                SourceText.From("{}"),
+                filePath: additionalPath);
+
+        var baseline = WorkspaceInputSnapshot.Create(entryPath);
+        var discovered = WorkspaceInputSnapshot.Create(solution, entryPath);
+
+        Assert.True(baseline.HasSameReloadInputs(discovered));
+    }
+
+    [Fact]
+    public void EntryBaselineChangeCheckTracksSourceButIgnoresIntermediateOutputs()
+    {
+        using var directory = new TemporaryDirectory();
+        var projectPath = directory.Write(
+            "Probe.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        directory.Write(
+            "Probe.cs",
+            "public sealed class Probe { }");
+        var baseline = WorkspaceInputSnapshot.Create(projectPath);
+
+        directory.Write(
+            "obj/Debug/net10.0/Probe.AssemblyInfo.cs",
+            "[assembly: System.Reflection.AssemblyVersion(\"1.0.0.0\")]");
+
+        Assert.False(baseline.HasComparableReloadInputsChanged());
+
+        directory.Write(
+            "Probe.cs",
+            "public sealed class Probe { public int Value => 1; }");
+
+        Assert.True(baseline.HasComparableReloadInputsChanged());
+    }
+
     [Fact]
     public void EntryBaselineRetriesForLinkedSourceOutsideInitialRoot()
     {

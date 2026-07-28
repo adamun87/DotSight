@@ -39,6 +39,11 @@ internal sealed class WorkspaceInputSnapshot
         "node_modules",
         "packages",
     };
+    private static readonly HashSet<string> InitialComparisonSkippedDirectories =
+        new(SkippedDirectories, StringComparer.OrdinalIgnoreCase)
+        {
+            "obj",
+        };
 
     private static readonly string[] CommonBuildInputs =
     [
@@ -154,6 +159,18 @@ internal sealed class WorkspaceInputSnapshot
         }
 
         return false;
+    }
+
+    public bool HasComparableReloadInputsChanged()
+    {
+        var expected = GetComparableReloadInputStamps(_files);
+        var current = GetComparableReloadInputStamps(CaptureFiles(_roots, _knownInputs));
+        if (current.Count != expected.Count)
+            return true;
+
+        return expected.Any(item =>
+            !current.TryGetValue(item.Key, out var currentStamp)
+            || currentStamp != item.Value);
     }
 
     public bool HasSameReloadInputs(WorkspaceInputSnapshot other)
@@ -314,29 +331,33 @@ internal sealed class WorkspaceInputSnapshot
 
     private static bool IsInSkippedDirectory(string path)
     {
+        return IsInNamedDirectory(path, SkippedDirectories);
+    }
+
+    private static bool IsInInitialComparisonSkippedDirectory(string path)
+    {
+        return IsInNamedDirectory(path, InitialComparisonSkippedDirectories);
+    }
+
+    private static bool IsInNamedDirectory(string path, HashSet<string> directoryNames)
+    {
         for (var directory = new DirectoryInfo(path);
              directory is not null;
              directory = directory.Parent)
         {
-            if (SkippedDirectories.Contains(directory.Name))
+            if (directoryNames.Contains(directory.Name))
                 return true;
         }
 
         return false;
     }
 
-    private static bool IsReloadInput(string path)
-    {
-        var extension = Path.GetExtension(path);
-        return !extension.Equals(".dll", StringComparison.OrdinalIgnoreCase)
-            && !extension.Equals(".exe", StringComparison.OrdinalIgnoreCase)
-            && !extension.Equals(".winmd", StringComparison.OrdinalIgnoreCase);
-    }
-
+    // MSBuild-only text and intermediate outputs are validated by the post-open snapshot.
     private bool IsComparableReloadInput(string path) =>
-        IsReloadInput(path)
-        && (_roots.Any(root => IsPathWithin(path, root))
-            || CommonBuildInputs.Contains(Path.GetFileName(path), StringComparer.OrdinalIgnoreCase));
+        !IsInInitialComparisonSkippedDirectory(Path.GetDirectoryName(path) ?? path)
+        && (CommonBuildInputs.Contains(Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+            || (_roots.Any(root => IsPathWithin(path, root))
+                && IsRelevantFile(path)));
 
     private List<string> GetNewRoots(WorkspaceInputSnapshot other) =>
         other._roots
@@ -349,6 +370,12 @@ internal sealed class WorkspaceInputSnapshot
             .Where(item => item.Value.Exists && IsComparableReloadInput(item.Key))
             .Select(item => item.Key)
             .ToHashSet(FilePathComparer);
+
+    private Dictionary<string, FileStamp> GetComparableReloadInputStamps(
+        IEnumerable<KeyValuePair<string, FileStamp>> files) =>
+        files
+            .Where(item => IsComparableReloadInput(item.Key))
+            .ToDictionary(item => item.Key, item => item.Value, FilePathComparer);
 
     private static bool IsPathWithin(string candidate, string root)
     {

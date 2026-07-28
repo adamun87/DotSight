@@ -107,6 +107,7 @@ public sealed class WorkspaceService : IDisposable
         var loadBaseline = isReloadingCurrentPath
             ? WorkspaceInputSnapshot.Create(current!.Solution, path)
             : WorkspaceInputSnapshot.Create(path);
+        var hasDiscoveredLoadBaseline = isReloadingCurrentPath;
 
         for (var attempt = 1; attempt <= maxLoadAttempts; attempt++)
         {
@@ -151,15 +152,20 @@ public sealed class WorkspaceService : IDisposable
                         path,
                         string.Join(", ", loadBaseline.GetNewReloadInputs(discoveredSnapshot).Take(10)));
                     loadBaseline = discoveredSnapshot;
+                    hasDiscoveredLoadBaseline = true;
                     continue;
                 }
 
-                if (loadBaseline.HasChanged())
+                var loadInputsChanged = hasDiscoveredLoadBaseline
+                    ? loadBaseline.HasChanged()
+                    : loadBaseline.HasComparableReloadInputsChanged();
+                if (loadInputsChanged)
                 {
                     _logger.LogWarning(
                         "Workspace inputs changed while loading {Path}; retrying with a fresh snapshot",
                         path);
                     loadBaseline = discoveredSnapshot;
+                    hasDiscoveredLoadBaseline = true;
                     continue;
                 }
 
@@ -170,6 +176,7 @@ public sealed class WorkspaceService : IDisposable
                         "Workspace inputs changed while materializing {Path}; retrying with a fresh snapshot",
                         path);
                     loadBaseline = WorkspaceInputSnapshot.Create(candidateSolution, path);
+                    hasDiscoveredLoadBaseline = true;
                     continue;
                 }
 
@@ -177,6 +184,7 @@ public sealed class WorkspaceService : IDisposable
                 if (candidateSnapshot.HasChanged())
                 {
                     loadBaseline = candidateSnapshot;
+                    hasDiscoveredLoadBaseline = true;
                     continue;
                 }
 
