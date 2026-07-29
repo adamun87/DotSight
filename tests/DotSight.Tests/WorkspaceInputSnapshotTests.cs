@@ -169,6 +169,48 @@ public sealed class WorkspaceInputSnapshotTests
         Assert.True(baseline.HasSameReloadInputs(discovered));
     }
 
+    [Theory]
+    [InlineData("global.json", "{}")]
+    [InlineData("NuGet.Config", "<configuration />")]
+    public void EntryBaselineFindsCommonBuildInputsInNestedProjectDirectories(
+        string fileName,
+        string contents)
+    {
+        using var directory = new TemporaryDirectory();
+        var entryPath = directory.Write("solution/Demo.sln", "");
+        var projectPath = directory.Write(
+            "solution/src/Probe/Probe.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+        var sourcePath = directory.Write(
+            "solution/src/Probe/Probe.cs",
+            "public sealed class Probe { }");
+        directory.Write($"solution/src/Probe/{fileName}", contents);
+        using var workspace = new AdhocWorkspace();
+        workspace.AddSolution(SolutionInfo.Create(
+            SolutionId.CreateNewId(),
+            VersionStamp.Create(),
+            filePath: entryPath));
+        var projectId = ProjectId.CreateNewId("Probe");
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId,
+                VersionStamp.Create(),
+                "Probe",
+                "Probe",
+                LanguageNames.CSharp,
+                filePath: projectPath))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Probe.cs",
+                SourceText.From("public sealed class Probe { }"),
+                filePath: sourcePath);
+
+        var baseline = WorkspaceInputSnapshot.Create(entryPath);
+        var discovered = WorkspaceInputSnapshot.Create(solution, entryPath);
+
+        Assert.True(baseline.HasSameReloadInputs(discovered));
+    }
+
     [Fact]
     public void EntryBaselineChangeCheckTracksSourceButIgnoresIntermediateOutputs()
     {

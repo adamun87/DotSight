@@ -139,6 +139,44 @@ public sealed class WorkspaceServiceFreshnessTests
             string.Join(Environment.NewLine, logger.Messages));
     }
 
+    [Fact]
+    public async Task GetSnapshotAsync_OpensSolutionOnceWithNestedGlobalJson()
+    {
+        using var directory = new TemporaryProject();
+        var solutionPath = directory.Write(
+            "CommonInputs.slnx",
+            """
+            <Solution>
+              <Project Path="src/CommonInputs/CommonInputs.csproj" />
+            </Solution>
+            """);
+        directory.Write(
+            "src/CommonInputs/CommonInputs.csproj",
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup>
+                <TargetFramework>net10.0</TargetFramework>
+              </PropertyGroup>
+            </Project>
+            """);
+        directory.Write(
+            "src/CommonInputs/Feature.cs",
+            "public sealed class Feature { }");
+        directory.Write("src/CommonInputs/global.json", "{}");
+        var logger = new OpeningAttemptLogger();
+        using var workspace = new WorkspaceService(
+            new WorkspaceOptions(solutionPath),
+            logger);
+
+        using var snapshot = await workspace.GetSnapshotAsync(
+            ct: TestContext.Current.CancellationToken);
+
+        Assert.Single(snapshot.Solution.Projects);
+        Assert.True(
+            logger.OpeningAttempts == 1,
+            string.Join(Environment.NewLine, logger.Messages));
+    }
+
     private static long GetSnapshotVersion(WorkspaceService workspace)
     {
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(workspace.GetSnapshotInfo()));
@@ -185,6 +223,7 @@ public sealed class WorkspaceServiceFreshnessTests
         public string Write(string relativePath, string contents)
         {
             var path = System.IO.Path.Combine(Path, relativePath);
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
             File.WriteAllText(path, contents);
             return path;
         }

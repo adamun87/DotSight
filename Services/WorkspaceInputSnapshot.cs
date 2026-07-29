@@ -323,6 +323,9 @@ internal sealed class WorkspaceInputSnapshot
         if (RelevantExtensions.Contains(Path.GetExtension(path)))
             return true;
 
+        if (CommonBuildInputs.Contains(Path.GetFileName(path), StringComparer.OrdinalIgnoreCase))
+            return true;
+
         return string.Equals(
             Path.GetFileName(path),
             "project.assets.json",
